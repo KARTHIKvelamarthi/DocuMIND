@@ -1,12 +1,18 @@
+import { useShallow } from 'zustand/react/shallow';
 import useAppStore from '../store/useAppStore';
 import '../styles/TopBar.css';
 
 export default function TopBar() {
-  const selectedGroupId = useAppStore((s) => s.selectedGroupId);
-  const selectedChatId  = useAppStore((s) => s.selectedChatId);
-  const groups          = useAppStore((s) => s.groups);
-  const chats           = useAppStore((s) => s.chats);
   const selectChat      = useAppStore((s) => s.selectChat);
+  const selectedGroupId = useAppStore((s) => s.users[s.user?.username]?.selectedGroupId ?? null);
+  const selectedChatId  = useAppStore((s) => s.users[s.user?.username]?.selectedChatId  ?? null);
+
+  const groups = useAppStore(
+    useShallow((s) => s.users[s.user?.username]?.groups ?? [])
+  );
+  const chats = useAppStore(
+    useShallow((s) => s.users[s.user?.username]?.chats ?? [])
+  );
 
   const group      = groups.find((g) => g.id === selectedGroupId) ?? null;
   const groupChats = chats.filter((c) => c.groupId === selectedGroupId);
@@ -16,10 +22,8 @@ export default function TopBar() {
       <div className="topbar-left">
         {group
           ? <span className="topbar-group-name">📁 {group.name}</span>
-          : <span className="topbar-placeholder">Select a group to see chats</span>
-        }
+          : <span className="topbar-placeholder">Select a group to see chats</span>}
       </div>
-
       <div className="topbar-chats">
         {groupChats.map((chat) => (
           <button

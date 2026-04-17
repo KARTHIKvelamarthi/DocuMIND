@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import useAppStore from '../store/useAppStore';
 import { sendQuery } from '../api';
 import MessageBubble from './MessageBubble';
@@ -7,12 +8,17 @@ import FeatureGrid from './FeatureGrid';
 import '../styles/ChatArea.css';
 
 export default function ChatArea() {
-  const selectedChatId = useAppStore((s) => s.selectedChatId);
-  const chats          = useAppStore((s) => s.chats);
   const addMessage     = useAppStore((s) => s.addMessage);
+  const token          = useAppStore((s) => s.user?.token);
+  const selectedChatId = useAppStore((s) => s.users[s.user?.username]?.selectedChatId ?? null);
 
-  // Derive active chat directly — no function call in selector
-  const chat = chats.find((c) => c.id === selectedChatId) ?? null;
+  const chat = useAppStore(
+    useShallow((s) => {
+      const u  = s.user?.username;
+      const id = s.users[u]?.selectedChatId;
+      return s.users[u]?.chats?.find((c) => c.id === id) ?? null;
+    })
+  );
 
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef();
@@ -23,19 +29,15 @@ export default function ChatArea() {
 
   const handleSend = async (text) => {
     if (!chat || chat.selectedPdfIds.length === 0) return;
-
     const selectedPdfs = chat.pdfs.filter((p) => chat.selectedPdfIds.includes(p.id));
 
     addMessage(selectedChatId, {
-      id:        crypto.randomUUID(),
-      role:      'user',
-      content:   text,
-      timestamp: Date.now(),
+      id: crypto.randomUUID(), role: 'user', content: text, timestamp: Date.now(),
     });
 
     setLoading(true);
     try {
-      const result = await sendQuery(text, selectedPdfs, selectedChatId);
+      const result = await sendQuery(text, selectedPdfs, selectedChatId, token);
       addMessage(selectedChatId, {
         id:          crypto.randomUUID(),
         role:        'assistant',
@@ -50,31 +52,25 @@ export default function ChatArea() {
       });
     } catch (err) {
       addMessage(selectedChatId, {
-        id:        crypto.randomUUID(),
-        role:      'assistant',
-        content:   `⚠️ ${err.message}`,
-        timestamp: Date.now(),
+        id: crypto.randomUUID(), role: 'assistant',
+        content: `⚠️ ${err.message}`, timestamp: Date.now(),
       });
     } finally {
       setLoading(false);
     }
   };
 
-  const noChat        = !chat;
+  // ChatArea is only rendered when a chat IS active (MainPage handles the gate)
   const noPdfSelected = chat && chat.selectedPdfIds.length === 0;
   const isEmpty       = chat && chat.messages.length === 0;
 
   return (
     <main className="chat-area">
       <div className="chat-messages">
-        {noChat || isEmpty ? (
-          <FeatureGrid />
-        ) : (
-          chat.messages.map((msg) => (
-            <MessageBubble key={msg.id} message={msg} />
-          ))
-        )}
-
+        {isEmpty
+          ? <FeatureGrid />
+          : chat.messages.map((msg) => <MessageBubble key={msg.id} message={msg} />)
+        }
         {loading && (
           <div className="bubble-row assistant">
             <div className="bubble-avatar">🧠</div>
@@ -85,12 +81,7 @@ export default function ChatArea() {
         )}
         <div ref={bottomRef} />
       </div>
-
-      <InputBar
-        onSend={handleSend}
-        disabled={noChat || noPdfSelected}
-        loading={loading}
-      />
+      <InputBar onSend={handleSend} disabled={noPdfSelected} loading={loading} />
     </main>
   );
 }

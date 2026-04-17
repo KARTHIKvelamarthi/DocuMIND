@@ -4,21 +4,35 @@ import LoginModal from './components/LoginModal';
 import MainPage from './pages/MainPage';
 import './styles/global.css';
 
-// Error boundary catches render crashes and shows a readable message
+function hardReset() {
+  localStorage.clear();
+  sessionStorage.clear();
+  window.location.href = window.location.href; // force full reload
+}
+
 class ErrorBoundary extends Component {
   state = { error: null };
   static getDerivedStateFromError(error) { return { error }; }
   render() {
     if (this.state.error) {
       return (
-        <div style={{ padding: 40, fontFamily: 'monospace', color: '#dc2626', background: '#fdf2f2', minHeight: '100vh' }}>
+        <div style={{
+          padding: 40, fontFamily: 'monospace', color: '#dc2626',
+          background: '#fdf2f2', minHeight: '100vh'
+        }}>
           <h2>Something went wrong</h2>
-          <pre style={{ marginTop: 16, whiteSpace: 'pre-wrap' }}>{this.state.error.message}</pre>
+          <pre style={{ marginTop: 16, whiteSpace: 'pre-wrap', fontSize: 13 }}>
+            {this.state.error.message}
+          </pre>
           <button
-            style={{ marginTop: 24, padding: '8px 16px', cursor: 'pointer' }}
-            onClick={() => { localStorage.removeItem('documind-storage'); window.location.reload(); }}
+            style={{
+              marginTop: 24, padding: '10px 20px', cursor: 'pointer',
+              background: '#dc2626', color: '#fff', border: 'none',
+              borderRadius: 8, fontSize: 14, fontWeight: 600
+            }}
+            onClick={hardReset}
           >
-            Clear storage &amp; reload
+            Clear all data &amp; reload
           </button>
         </div>
       );

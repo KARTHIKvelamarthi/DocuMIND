@@ -1,16 +1,20 @@
 import { useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import useAppStore from '../store/useAppStore';
 
 export default function ChatList({ groupId }) {
-  const allChats       = useAppStore((s) => s.chats);
-  const chats          = allChats.filter((c) => c.groupId === groupId);
-  const selectedChatId = useAppStore((s) => s.selectedChatId);
+  const selectedChatId = useAppStore((s) => s.users[s.user?.username]?.selectedChatId ?? null);
+
+  const groupChats = useAppStore(
+    useShallow((s) => (s.users[s.user?.username]?.chats ?? []).filter((c) => c.groupId === groupId))
+  );
+
   const selectChat = useAppStore((s) => s.selectChat);
   const renameChat = useAppStore((s) => s.renameChat);
   const deleteChat = useAppStore((s) => s.deleteChat);
 
   const [editingId, setEditingId] = useState(null);
-  const [editName, setEditName] = useState('');
+  const [editName, setEditName]   = useState('');
 
   const startEdit = (e, chat) => {
     e.stopPropagation();
@@ -23,13 +27,11 @@ export default function ChatList({ groupId }) {
     setEditingId(null);
   };
 
-  if (chats.length === 0) {
-    return <p className="empty-hint indent">No chats yet.</p>;
-  }
+  if (groupChats.length === 0) return <p className="empty-hint indent">No chats yet.</p>;
 
   return (
     <div className="chat-list">
-      {chats.map((chat) => (
+      {groupChats.map((chat) => (
         <div
           key={chat.id}
           className={`chat-item ${selectedChatId === chat.id ? 'active' : ''}`}
@@ -52,12 +54,9 @@ export default function ChatList({ groupId }) {
           )}
 
           <div className="chat-actions">
-            <button className="icon-btn sm" onClick={(e) => startEdit(e, chat)} title="Rename">✏️</button>
-            <button
-              className="icon-btn sm danger"
-              onClick={(e) => { e.stopPropagation(); deleteChat(chat.id); }}
-              title="Delete"
-            >🗑</button>
+            <button className="icon-btn sm" onClick={(e) => startEdit(e, chat)}>✏️</button>
+            <button className="icon-btn sm danger"
+              onClick={(e) => { e.stopPropagation(); deleteChat(chat.id); }}>🗑</button>
           </div>
         </div>
       ))}

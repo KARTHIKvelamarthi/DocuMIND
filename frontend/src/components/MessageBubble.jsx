@@ -2,6 +2,32 @@ import '../styles/MessageBubble.css';
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 
+// Render a 2-D array as an HTML table. First row is treated as header.
+function TableView({ rows }) {
+  if (!rows || rows.length === 0) return null;
+  const [head, ...body] = rows;
+  return (
+    <table className="extracted-table">
+      <thead>
+        <tr>
+          {head.map((cell, i) => (
+            <th key={i}>{cell ?? ''}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {body.map((row, ri) => (
+          <tr key={ri}>
+            {row.map((cell, ci) => (
+              <td key={ci}>{cell ?? ''}</td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 export default function MessageBubble({ message }) {
   const isUser = message.role === 'user';
   const isDual = !isUser && (message.doc1_answer || message.doc2_answer);
@@ -44,7 +70,6 @@ export default function MessageBubble({ message }) {
             <p className="visuals-label">🖼️ Extracted Images</p>
             <div className="image-grid">
               {message.images.map((imgPath, i) => {
-                // Convert absolute server path to a URL served by FastAPI static files
                 const filename = imgPath.replace(/\\/g, '/').split('/').pop();
                 const src = `${BASE_URL}/assets/images/${filename}`;
                 return (
@@ -61,8 +86,10 @@ export default function MessageBubble({ message }) {
         {message.tables?.length > 0 && (
           <div className="bubble-tables">
             <p className="visuals-label">📊 Extracted Tables</p>
-            {message.tables.map((tbl, i) => (
-              <pre key={i} className="table-preview">{tbl}</pre>
+            {message.tables.map((rows, i) => (
+              <div key={i} className="table-wrapper">
+                <TableView rows={rows} />
+              </div>
             ))}
           </div>
         )}

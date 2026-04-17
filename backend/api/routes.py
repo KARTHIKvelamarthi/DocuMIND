@@ -1,11 +1,14 @@
 # backend/api/routes.py
 import os, shutil, uuid
-from fastapi import APIRouter, UploadFile, File, HTTPException
-from fastapi.staticfiles import StaticFiles
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List
+from sqlalchemy.orm import Session
+import bcrypt
 
-from backend.services.rag_service import run_query
+from backend.auth.jwt_handler import create_token, get_current_user
+from backend.services.rag_service import run_query, preload_retriever
+from backend.db.database import get_db, User
 
 router = APIRouter()
 
@@ -13,52 +16,85 @@ UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
+# ── /register ─────────────────────────────────────────────────────────────────
+class AuthRequest(BaseModel):
+    username: str
+    password: str
+
+
+@router.post("/register", status_code=201)
+def register(req: AuthRequest, db: Session = Depends(get_db)):
+    if not req.username.strip() or not req.password:
+        raise HTTPException(400, "Username and password are required.")
+    if db.query(User).filter(User.username == req.username.strip()).first():
+        raise HTTPException(409, "Username already taken.")
+    hashed = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+    db.add(User(username=req.username.strip(), password_hash=hashed))
+    db.commit()
+    return {"message": "Account created successfully."}
+
+
+# ── /login ────────────────────────────────────────────────────────────────────
+@router.post("/login")
+def login(req: AuthRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == req.username.strip()).first()
+    if not user or not bcrypt.checkpw(req.password.encode(), user.password_hash.encode()):
+        raise HTTPException(401, "Invalid username or password.")
+    token = create_token(user.id, user.username)
+    return {"username": user.username, "token": token}
+
+
 # ── /upload ───────────────────────────────────────────────────────────────────
 @router.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(
+    file:    UploadFile = File(...),
+    chat_id: str = "default",
+    current_user: dict = Depends(get_current_user),
+):
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+        raise HTTPException(400, "Only PDF files are accepted.")
 
-    file_id = str(uuid.uuid4())
+    file_id   = str(uuid.uuid4())
     safe_name = f"{file_id}_{file.filename}"
-    dest = os.path.join(UPLOAD_DIR, safe_name)
+    dest      = os.path.join(UPLOAD_DIR, safe_name)
 
     with open(dest, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    return {
-        "id": file_id,
-        "name": file.filename,
-        "path": dest,
-    }
+    try:
+        preload_retriever(current_user["user_id"], chat_id, dest)
+    except Exception as e:
+        print(f"[upload] Preload warning: {e}")
+
+    return {"id": file_id, "name": file.filename, "path": dest}
 
 
 # ── /query ────────────────────────────────────────────────────────────────────
 class QueryRequest(BaseModel):
-    query: str
-    pdfs: List[str]   # list of server-side file paths returned by /upload
+    query:   str
+    pdfs:    List[str]
     chat_id: str
 
 
 @router.post("/query")
-async def query_endpoint(req: QueryRequest):
+async def query_endpoint(
+    req: QueryRequest,
+    current_user: dict = Depends(get_current_user),
+):
     if not req.pdfs:
-        raise HTTPException(status_code=400, detail="At least one PDF path is required.")
+        raise HTTPException(400, "At least one PDF path is required.")
     if len(req.pdfs) > 2:
-        raise HTTPException(status_code=400, detail="Maximum 2 PDFs supported.")
-
-    # Validate paths exist
+        raise HTTPException(400, "Maximum 2 PDFs supported.")
     for p in req.pdfs:
         if not os.path.isfile(p):
-            raise HTTPException(status_code=404, detail=f"PDF not found on server: {p}")
+            raise HTTPException(404, f"PDF not found on server: {p}")
 
     try:
-        result = run_query(req.chat_id, req.query, req.pdfs)
+        result = run_query(current_user["user_id"], req.chat_id, req.query, req.pdfs)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
 
-    # Parse dual-doc answer into structured fields
-    answer = result.get("answer", "")
+    answer      = result.get("answer", "")
     doc1_answer = doc2_answer = comparison = ""
 
     if len(req.pdfs) == 2:
@@ -66,8 +102,7 @@ async def query_endpoint(req: QueryRequest):
         doc2_answer = _extract_section(answer, "[Doc2 Answer]", "[Comparison]")
         comparison  = _extract_section(answer, "[Comparison]", None)
 
-    # Collect structured visuals from chunks
-    images, tables = _collect_visuals(result.get("visuals", ""))
+    images, tables = _collect_visuals(result.get("visuals", ""), result.get("raw_tables", []))
 
     return {
         "answer":      answer,
@@ -92,13 +127,12 @@ def _extract_section(text: str, start_tag: str, end_tag: str | None) -> str:
         return ""
 
 
-def _collect_visuals(visuals_text: str):
-    """Parse the plain-text visuals summary into image paths and table rows."""
-    images, tables = [], []
+def _collect_visuals(visuals_text: str, raw_tables: list):
+    """Extract image paths from visuals text; use raw_tables for structured data."""
+    images = []
     for line in visuals_text.splitlines():
         line = line.strip()
         if line.startswith("📷 Image:"):
             images.append(line.replace("📷 Image:", "").strip())
-        elif line.startswith("📊 Table"):
-            tables.append(line)
-    return images, tables
+    # raw_tables is already List[List[List[str]]] — pass through directly
+    return images, raw_tables

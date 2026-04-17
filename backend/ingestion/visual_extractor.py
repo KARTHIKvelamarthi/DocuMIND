@@ -11,47 +11,87 @@ import pdfplumber
 
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "images")
 
+# Images smaller than this (in either dimension) are treated as icons and skipped
+MIN_IMAGE_PX = 60
+
+# Header/footer zone: images whose top edge is within this many points of the
+# page top, or whose bottom edge is within this many points of the page bottom,
+# are considered decorative and skipped.
+HEADER_FOOTER_MARGIN = 80
+
 
 # ---------------------------------------------------------------------------
-# Image extraction
+# Image extraction  (header/footer + tiny-image filtering)
 # ---------------------------------------------------------------------------
 
 def extract_images(file_path: str, assets_dir: str = ASSETS_DIR) -> List[Dict]:
     """
-    Extract all images from a PDF using PyMuPDF.
+    Extract content images from a PDF using PyMuPDF.
+    Skips images located in the header/footer zone and very small icons.
 
     Returns:
         List of { "page": int, "path": str }
     """
     os.makedirs(assets_dir, exist_ok=True)
     results = []
+    skipped = 0
 
     doc = fitz.open(file_path)
     pdf_name = os.path.splitext(os.path.basename(file_path))[0]
 
     for page_num in range(len(doc)):
-        page = doc[page_num]
+        page       = doc[page_num]
+        page_h     = page.rect.height
         image_list = page.get_images(full=True)
 
         for img_index, img in enumerate(image_list):
             xref = img[0]
-            base_image = doc.extract_image(xref)
-            image_bytes = base_image["image"]
-            ext = base_image["ext"]
 
-            filename = f"{pdf_name}_p{page_num + 1}_img{img_index + 1}.{ext}"
+            # ── Position filter ──────────────────────────────────────────────
+            try:
+                rects = page.get_image_rects(xref)
+            except Exception:
+                rects = []
+
+            in_header_footer = False
+            if rects:
+                bbox = rects[0]          # fitz.Rect
+                y_top    = bbox.y0
+                y_bottom = bbox.y1
+                width    = bbox.width
+                height   = bbox.height
+
+                # Skip header/footer zone
+                if y_top < HEADER_FOOTER_MARGIN or y_bottom > page_h - HEADER_FOOTER_MARGIN:
+                    in_header_footer = True
+
+                # Skip tiny icons
+                if width < MIN_IMAGE_PX or height < MIN_IMAGE_PX:
+                    in_header_footer = True
+
+            if in_header_footer:
+                skipped += 1
+                continue
+
+            # ── Extract & save ───────────────────────────────────────────────
+            try:
+                base_image   = doc.extract_image(xref)
+                image_bytes  = base_image["image"]
+                ext          = base_image["ext"]
+            except Exception:
+                continue
+
+            filename  = f"{pdf_name}_p{page_num + 1}_img{img_index + 1}.{ext}"
             save_path = os.path.join(assets_dir, filename)
 
             with open(save_path, "wb") as f:
                 f.write(image_bytes)
 
-            results.append({
-                "page": page_num + 1,
-                "path": save_path,
-            })
+            results.append({"page": page_num + 1, "path": save_path})
 
     doc.close()
-    print(f"   Extracted {len(results)} images from '{os.path.basename(file_path)}'")
+    print(f"   Extracted {len(results)} images ({skipped} header/footer/icon skipped) "
+          f"from '{os.path.basename(file_path)}'")
     return results
 
 

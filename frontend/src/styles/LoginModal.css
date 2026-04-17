@@ -84,3 +84,38 @@
   font-size: 12px;
   text-align: center;
 }
+
+/* ── Auth tabs ───────────────────────────────────────────── */
+.auth-tabs {
+  display: flex;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  border: 1.5px solid var(--beige-dark);
+  margin-bottom: 4px;
+}
+
+.auth-tab {
+  flex: 1;
+  padding: 8px;
+  background: transparent;
+  border: none;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.auth-tab:hover { background: var(--beige-mid); color: var(--text-dark); }
+.auth-tab.active {
+  background: var(--green-mid);
+  color: #fff;
+}
+
+.login-success {
+  color: var(--green-dark);
+  font-size: 12px;
+  text-align: center;
+  background: var(--green-pale);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+}

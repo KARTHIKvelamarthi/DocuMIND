@@ -9,12 +9,18 @@
 .chat-messages {
   flex: 1;
   overflow-y: auto;
-  padding: 24px 32px;
+  /* right padding keeps messages clear of the floating PDF panel */
+  padding: 24px 300px 24px 32px;
   display: flex;
   flex-direction: column;
   gap: 16px;
   scrollbar-width: thin;
   scrollbar-color: var(--beige-dark) transparent;
+}
+
+/* On smaller screens collapse the right padding */
+@media (max-width: 900px) {
+  .chat-messages { padding: 20px 20px 20px 20px; }
 }
 
 /* Typing indicator */

@@ -4,6 +4,7 @@
   overflow: hidden;
 }
 
+/* Center column — takes all remaining space */
 .app-center {
   flex: 1;
   display: flex;

@@ -1,52 +1,102 @@
-.pdf-selector {
-  width: var(--pdf-panel-w);
-  min-width: var(--pdf-panel-w);
+/* ── Floating PDF panel ───────────────────────────────────── */
+.pdf-float {
+  position: fixed;
+  top: calc(var(--topbar-h) + 14px);
+  right: 16px;
+  width: 270px;
   background: var(--beige-white);
-  border-left: 1px solid var(--beige-mid);
+  border: 1px solid var(--beige-mid);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md), 0 0 0 1px rgba(116,198,157,.15);
   display: flex;
   flex-direction: column;
-  gap: 0;
+  z-index: 100;
   overflow: hidden;
+  animation: floatIn .2s ease;
 }
 
-.pdf-selector-header {
-  padding: 14px 14px 10px;
-  border-bottom: 1px solid var(--beige-mid);
+@keyframes floatIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
+
+.pdf-float--collapsed {
+  width: 200px;
+}
+
+/* ── Header ───────────────────────────────────────────────── */
+.pdf-float-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--beige-mid);
+  cursor: pointer;
+  user-select: none;
+  background: var(--beige-light);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  transition: background .15s;
+}
+.pdf-float-header:hover { background: var(--beige-mid); }
 
 .pdf-selector-title {
-  font-size: 13px;
-  font-weight: 600;
+  font-size: 12px;
+  font-weight: 700;
   color: var(--green-dark);
+  letter-spacing: .2px;
 }
 
-.pdf-hint {
-  font-size: 11px;
+.pdf-collapse-btn {
+  background: none;
+  border: none;
+  font-size: 12px;
   color: var(--text-muted);
-  padding: 10px 14px;
-  line-height: 1.5;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
 }
 
-.pdf-list {
-  flex: 1;
-  overflow-y: auto;
-  padding: 8px 10px;
+/* ── Upload area ──────────────────────────────────────────── */
+.pdf-upload-area {
+  padding: 10px 12px 6px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 5px;
+}
+
+.upload-btn {
+  width: 100%;
+  padding: 8px;
+  background: var(--green-mid);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .15s;
+}
+.upload-btn:hover:not(:disabled) { background: var(--green-dark); }
+.upload-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+/* ── PDF list ─────────────────────────────────────────────── */
+.pdf-list {
+  padding: 6px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
 }
 
 .pdf-item {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 10px;
+  padding: 7px 9px;
   border-radius: var(--radius-md);
   border: 1.5px solid var(--beige-mid);
   background: var(--beige-light);
   transition: border-color .15s, background .15s;
 }
-
 .pdf-item.pdf-selected {
   border-color: var(--green-mid);
   background: var(--green-pale);
@@ -60,17 +110,14 @@
   cursor: pointer;
   min-width: 0;
 }
-
 .pdf-label input[type="checkbox"] {
   accent-color: var(--green-mid);
-  width: 14px;
-  height: 14px;
+  width: 13px;
+  height: 13px;
   flex-shrink: 0;
 }
-
-.pdf-icon { font-size: 14px; flex-shrink: 0; }
-
-.pdf-name {
+.pdf-icon  { font-size: 13px; flex-shrink: 0; }
+.pdf-name  {
   font-size: 11px;
   color: var(--text-dark);
   overflow: hidden;
@@ -78,30 +125,9 @@
   text-overflow: ellipsis;
 }
 
-.pdf-upload-area {
-  padding: 10px 12px;
-  border-top: 1px solid var(--beige-mid);
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.upload-btn {
-  width: 100%;
-  padding: 8px;
-  background: var(--green-mid);
-  color: #fff;
-  border: none;
-  border-radius: var(--radius-md);
-  font-size: 12px;
-  font-weight: 600;
-  transition: background .15s;
-}
-.upload-btn:hover:not(:disabled) { background: var(--green-dark); }
-.upload-btn:disabled { opacity: .45; cursor: not-allowed; }
-
+/* ── Mode badge ───────────────────────────────────────────── */
 .pdf-mode-badge {
-  padding: 8px 12px 12px;
+  padding: 6px 12px 10px;
   display: flex;
   justify-content: center;
 }
@@ -117,8 +143,14 @@
 .badge-single { background: var(--green-pale); color: var(--green-dark); }
 .badge-dual   { background: var(--green-mid); color: #fff; }
 
+/* ── Misc ─────────────────────────────────────────────────── */
+.pdf-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 4px 2px;
+  line-height: 1.5;
+}
 .pdf-error {
   font-size: 11px;
   color: #dc2626;
-  padding: 2px 0;
 }

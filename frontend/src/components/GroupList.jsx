@@ -1,23 +1,29 @@
 import { useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import useAppStore from '../store/useAppStore';
 import ChatList from './ChatList';
 
 export default function GroupList() {
-  const groups = useAppStore((s) => s.groups);
-  const selectedGroupId = useAppStore((s) => s.selectedGroupId);
+  const username = useAppStore((s) => s.user?.username);
+  const selectedGroupId = useAppStore((s) => s.users[username]?.selectedGroupId ?? null);
+
+  // useShallow prevents new-reference re-renders for arrays
+  const groups = useAppStore(
+    useShallow((s) => s.users[s.user?.username]?.groups ?? [])
+  );
+
   const createGroup = useAppStore((s) => s.createGroup);
   const renameGroup = useAppStore((s) => s.renameGroup);
   const deleteGroup = useAppStore((s) => s.deleteGroup);
   const selectGroup = useAppStore((s) => s.selectGroup);
-  const createChat = useAppStore((s) => s.createChat);
+  const createChat  = useAppStore((s) => s.createChat);
 
   const [newGroupName, setNewGroupName] = useState('');
-  const [editingId, setEditingId] = useState(null);
-  const [editName, setEditName] = useState('');
+  const [editingId, setEditingId]       = useState(null);
+  const [editName, setEditName]         = useState('');
 
-  const handleCreateGroup = () => {
-    const name = newGroupName.trim() || 'New Group';
-    createGroup(name);
+  const handleCreate = () => {
+    createGroup(newGroupName.trim() || 'New Group');
     setNewGroupName('');
   };
 
@@ -34,20 +40,17 @@ export default function GroupList() {
 
   return (
     <div className="group-list">
-      {/* New group input */}
       <div className="new-group-row">
         <input
           placeholder="Group name…"
           value={newGroupName}
           onChange={(e) => setNewGroupName(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && handleCreateGroup()}
+          onKeyDown={(e) => e.key === 'Enter' && handleCreate()}
         />
-        <button className="icon-btn" onClick={handleCreateGroup} title="Create group">＋</button>
+        <button className="icon-btn" onClick={handleCreate} title="Create group">＋</button>
       </div>
 
-      {groups.length === 0 && (
-        <p className="empty-hint">No groups yet. Create one above.</p>
-      )}
+      {groups.length === 0 && <p className="empty-hint">No groups yet.</p>}
 
       {groups.map((group) => (
         <div key={group.id} className="group-item">
@@ -72,23 +75,15 @@ export default function GroupList() {
             )}
 
             <div className="group-actions">
-              <button className="icon-btn sm" onClick={(e) => startEdit(e, group)} title="Rename">✏️</button>
-              <button
-                className="icon-btn sm danger"
-                onClick={(e) => { e.stopPropagation(); deleteGroup(group.id); }}
-                title="Delete group"
-              >🗑</button>
-              <button
-                className="icon-btn sm"
-                onClick={(e) => { e.stopPropagation(); createChat(group.id); }}
-                title="New chat in group"
-              >💬</button>
+              <button className="icon-btn sm" onClick={(e) => startEdit(e, group)}>✏️</button>
+              <button className="icon-btn sm danger"
+                onClick={(e) => { e.stopPropagation(); deleteGroup(group.id); }}>🗑</button>
+              <button className="icon-btn sm"
+                onClick={(e) => { e.stopPropagation(); createChat(group.id); }}>💬</button>
             </div>
           </div>
 
-          {selectedGroupId === group.id && (
-            <ChatList groupId={group.id} />
-          )}
+          {selectedGroupId === group.id && <ChatList groupId={group.id} />}
         </div>
       ))}
     </div>
