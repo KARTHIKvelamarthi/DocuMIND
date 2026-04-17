@@ -4,6 +4,11 @@
 
 import sys, os, re
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+import hashlib
+
+def hash_table(table):
+    return hashlib.md5(str(table).encode()).hexdigest()
+
 
 from backend.retrieval.retriever import Retriever
 from backend.memory.memory import MemoryManager
@@ -111,11 +116,22 @@ def run_query(user_id: int, chat_id: str, query: str, pdf_paths: list[str]) -> d
 
     # Collect structured table data from retrieved chunks
     raw_tables = []
+    seen = set()
+
     for chunk in all_chunks:
         for tbl in chunk.get("tables", []):
             data = tbl.get("data")
-            if data:
-                raw_tables.append(data)
+            if not data:
+                continue
+
+            h = hash_table(data)
+
+            # 🚨 skip duplicates across chunks
+            if h in seen:
+                continue
+
+            seen.add(h)
+            raw_tables.append(data)
 
     return {
         "answer":     answer,

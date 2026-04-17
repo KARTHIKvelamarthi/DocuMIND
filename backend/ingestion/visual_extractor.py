@@ -7,7 +7,10 @@ from typing import List, Dict
 
 import fitz          # PyMuPDF
 import pdfplumber
+import hashlib
 
+def hash_table(table):
+    return hashlib.md5(str(table).encode()).hexdigest()
 
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "images")
 
@@ -99,26 +102,33 @@ def extract_images(file_path: str, assets_dir: str = ASSETS_DIR) -> List[Dict]:
 # Table extraction
 # ---------------------------------------------------------------------------
 
-def extract_tables(file_path: str) -> List[Dict]:
-    """
-    Extract all tables from a PDF using pdfplumber.
-
-    Returns:
-        List of { "page": int, "data": List[List] }
-    """
+def extract_tables(file_path: str):
     results = []
 
     with pdfplumber.open(file_path) as pdf:
         for page_num, page in enumerate(pdf.pages):
             tables = page.extract_tables()
-            for table in tables:
-                if table:
-                    results.append({
-                        "page": page_num + 1,
-                        "data": table,
-                    })
 
-    print(f"   Extracted {len(results)} tables from '{os.path.basename(file_path)}'")
+            seen_hashes = set()   # 👈 per-page dedup
+
+            for table in tables:
+                if not table:
+                    continue
+
+                table_hash = hash_table(table)
+
+                # 🚨 SKIP DUPLICATES
+                if table_hash in seen_hashes:
+                    continue
+
+                seen_hashes.add(table_hash)
+
+                results.append({
+                    "page": page_num + 1,
+                    "data": table,
+                })
+
+    print(f"   Extracted {len(results)} unique tables from '{file_path}'")
     return results
 
 

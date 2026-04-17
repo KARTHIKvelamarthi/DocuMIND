@@ -1,0 +1,6172 @@
+
+================================================================================
+FILE: snapshot.py
+================================================================================
+
+import os
+
+# Extensions to include
+INCLUDE_EXTENSIONS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx",
+    ".html", ".css", ".json", ".md"
+}
+
+# Folders to skip (important to avoid junk)
+EXCLUDE_DIRS = {
+    ".git", "node_modules", "__pycache__", "venv", ".venv", "dist", "build"
+}
+
+OUTPUT_FILE = "full_project.txt"
+
+
+def should_include_file(file_name):
+    _, ext = os.path.splitext(file_name)
+    return ext.lower() in INCLUDE_EXTENSIONS
+
+
+def is_excluded_dir(dirname):
+    return dirname in EXCLUDE_DIRS
+
+
+def dump_project(root_dir):
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as outfile:
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            # Remove excluded dirs in-place (important)
+            dirnames[:] = [d for d in dirnames if not is_excluded_dir(d)]
+
+            for file in filenames:
+                if should_include_file(file):
+                    full_path = os.path.join(dirpath, file)
+                    rel_path = os.path.relpath(full_path, root_dir)
+
+                    outfile.write(f"\n{'='*80}\n")
+                    outfile.write(f"FILE: {rel_path}\n")
+                    outfile.write(f"{'='*80}\n\n")
+
+                    try:
+                        with open(full_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                            outfile.write(content)
+                            outfile.write("\n\n")
+                    except Exception as e:
+                        outfile.write(f"[ERROR READING FILE: {e}]\n\n")
+
+
+if __name__ == "__main__":
+    root_directory = os.getcwd()
+    dump_project(root_directory)
+    print(f"✅ Done! Output written to {OUTPUT_FILE}")
+
+
+================================================================================
+FILE: ut.py
+================================================================================
+
+import re
+import numpy as np
+from collections import Counter
+
+import pdfplumber
+import faiss
+import nltk
+from nltk.tokenize import sent_tokenize
+
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from rank_bm25 import BM25Okapi
+
+nltk.download("punkt", quiet=True)
+nltk.download("punkt_tab", quiet=True)
+
+
+# -----------------------------------------------------------------------
+# CONFIG — tweak these for your document
+# -----------------------------------------------------------------------
+CHUNK_SIZE      = 200    # max words per content chunk
+OVERLAP         = 50     # word overlap between chunks
+HYBRID_TOP_K    = 15     # candidates from hybrid retrieval
+RERANK_TOP_K    = 5      # kept after cross-encoder
+CONTEXT_SIZE    = 6      # final assembled context window
+ALPHA           = 0.6    # 0=pure BM25, 1=pure semantic (0.6 favors semantic)
+
+# Heading detection: % of words that must be capitalized for a short line to be a heading
+# Raise this if too many content lines are classified as headings
+HEADING_CAP_RATIO = 0.5
+
+# Minimum font-size DELTA above median to be classified as heading
+# (e.g. 1.5 means the font must be 1.5pt larger than median body text)
+HEADING_SIZE_DELTA = 1.5
+
+
+# -----------------------------------------------------------------------
+# Step 1: Font-aware extraction with pdfplumber
+# -----------------------------------------------------------------------
+def extract_structured_blocks(file_path):
+    blocks = []
+    with pdfplumber.open(file_path) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            words = page.extract_words(extra_attrs=["size", "fontname"])
+            if not words:
+                continue
+
+            # Group words into lines by y-position
+            lines = {}
+            for word in words:
+                y = round(word["top"], 1)
+                lines.setdefault(y, []).append(word)
+
+            for y in sorted(lines.keys()):
+                line_words = lines[y]
+                text = " ".join(w["text"] for w in line_words).strip()
+                avg_size = sum(w["size"] for w in line_words) / len(line_words)
+                font = line_words[0]["fontname"]
+
+                if text:
+                    blocks.append({
+                        "text": text,
+                        "size": round(avg_size, 2),
+                        "font": font,
+                        "page": page_num + 1,
+                    })
+    return blocks
+
+
+def get_body_font_size(blocks):
+    """
+    Body text is the MOST COMMON font size in the document.
+    Much more reliable than percentile-based thresholding.
+    """
+    size_counter = Counter(round(b["size"], 1) for b in blocks)
+    body_size = size_counter.most_common(1)[0][0]
+    print(f"   Detected body font size: {body_size}pt")
+    return body_size
+
+
+# -----------------------------------------------------------------------
+# Step 2: Reliable heading classification
+# Uses BOTH font size delta AND capitalization ratio
+# -----------------------------------------------------------------------
+def classify_block(block, body_size):
+    text = block["text"].strip()
+    words = text.split()
+
+    if not words:
+        return "content"
+
+    # Bullet detection
+    if text[0] in ("•", "-", "–", "▪", "*"):
+        return "bullet"
+
+    size_delta = block["size"] - body_size
+    word_count = len(words)
+
+    # Strong heading signal: significantly larger font
+    if size_delta >= HEADING_SIZE_DELTA:
+        return "heading"
+
+    # Weak heading signal: same size but short + mostly capitalized
+    # (e.g. bold section titles rendered at same size)
+    if word_count <= 10 and not text.endswith("."):
+        cap_ratio = sum(1 for w in words if w[0].isupper()) / word_count
+        if cap_ratio >= HEADING_CAP_RATIO and size_delta >= 0:
+            return "heading"
+
+    return "content"
+
+
+# -----------------------------------------------------------------------
+# Step 3: Noise filtering
+# -----------------------------------------------------------------------
+def is_noise(text):
+    t = text.lower().strip()
+    if re.match(r"^page \d+", t):          return True
+    if "pg." in t and len(t.split()) <= 4: return True
+    if len(t.split()) <= 2:                return True
+    if re.match(r"^[\d\s\.\,\-]+$", t):   return True
+    return False
+
+
+# -----------------------------------------------------------------------
+# Step 4: Sentence-aware chunking
+# -----------------------------------------------------------------------
+def sentence_aware_chunk(text, chunk_size=CHUNK_SIZE, overlap=OVERLAP):
+    sentences = sent_tokenize(text)
+    chunks = []
+    current_words = []
+
+    for sentence in sentences:
+        words = sentence.split()
+        if len(current_words) + len(words) > chunk_size and current_words:
+            chunks.append(" ".join(current_words))
+            current_words = (current_words[-overlap:] if len(current_words) > overlap else current_words[:]) + words
+        else:
+            current_words.extend(words)
+
+    if current_words:
+        chunks.append(" ".join(current_words))
+
+    return chunks
+
+
+# -----------------------------------------------------------------------
+# Step 5: Build structured chunks
+# -----------------------------------------------------------------------
+def build_structured_chunks(file_path):
+    print("\n📄 Extracting structured blocks from PDF...")
+    blocks = extract_structured_blocks(file_path)
+    print(f"   Raw line-blocks extracted: {len(blocks)}")
+
+    body_size = get_body_font_size(blocks)
+
+    # Deduplicate repeated lines (headers/footers)
+    normalized_texts = [re.sub(r"\s+", " ", b["text"].lower()) for b in blocks]
+    counts = Counter(normalized_texts)
+
+    # ---- Merge consecutive same-type lines into paragraphs ----
+    merged = []
+    current_para = None
+
+    for block, norm in zip(blocks, normalized_texts):
+        if counts[norm] > 2 or is_noise(block["text"]):
+            continue
+
+        btype = classify_block(block, body_size)
+
+        if current_para is None:
+            current_para = {"text": block["text"], "size": block["size"],
+                            "font": block["font"], "page": block["page"], "type": btype}
+        elif btype == current_para["type"] and btype != "heading":
+            # Merge consecutive content/bullet lines into one paragraph
+            current_para["text"] += " " + block["text"]
+        else:
+            merged.append(current_para)
+            current_para = {"text": block["text"], "size": block["size"],
+                            "font": block["font"], "page": block["page"], "type": btype}
+
+    if current_para:
+        merged.append(current_para)
+
+    print(f"   Merged paragraph blocks: {len(merged)}")
+
+    # ---- Chunk merged paragraphs ----
+    raw_chunks = []
+    current_heading = None
+    heading_count = sum(1 for m in merged if m["type"] == "heading")
+    content_count  = sum(1 for m in merged if m["type"] != "heading")
+    print(f"   Headings: {heading_count} | Content/Bullet blocks: {content_count}")
+
+    for block in merged:
+        if block["type"] == "heading":
+            current_heading = block["text"].strip()
+            raw_chunks.append({
+                "text": current_heading,
+                "type": "heading",
+                "page": block["page"],
+                "heading": current_heading,
+            })
+        else:
+            sub_chunks = sentence_aware_chunk(block["text"])
+            for sub in sub_chunks:
+                raw_chunks.append({
+                    "text": sub,
+                    "type": block["type"],
+                    "page": block["page"],
+                    "heading": current_heading,
+                })
+
+    heading_final  = sum(1 for c in raw_chunks if c["type"] == "heading")
+    content_final  = sum(1 for c in raw_chunks if c["type"] != "heading")
+    print(f"   Final chunks → headings: {heading_final} | content+bullet: {content_final}")
+
+    if heading_final > content_final:
+        print("\n⚠️  WARNING: More headings than content chunks detected!")
+        print("   → Increase HEADING_SIZE_DELTA or HEADING_CAP_RATIO in CONFIG.")
+        print("   → Run diagnose_fonts.py to inspect your document's font sizes.\n")
+
+    return raw_chunks
+
+
+# -----------------------------------------------------------------------
+# Step 6: Embed chunks
+# -----------------------------------------------------------------------
+def embed_chunks(raw_chunks, model):
+    texts = [c["text"] for c in raw_chunks]
+    embeddings = model.encode(texts, show_progress_bar=True, batch_size=64)
+
+    chunks = []
+    for i, (chunk, emb) in enumerate(zip(raw_chunks, embeddings)):
+        chunks.append({
+            "id":      i,
+            "text":    chunk["text"],
+            "type":    chunk["type"],
+            "page":    chunk["page"],
+            "heading": chunk.get("heading"),
+            "embedding": emb.astype("float32"),
+            "length":  len(chunk["text"].split()),
+            "links":   [],
+        })
+    return chunks
+
+
+# -----------------------------------------------------------------------
+# Step 7: FAISS index
+# -----------------------------------------------------------------------
+def build_faiss_index(chunks):
+    embeddings = np.array([c["embedding"] for c in chunks]).astype("float32")
+    faiss.normalize_L2(embeddings)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+    print(f"   FAISS index: {index.ntotal} vectors (dim={embeddings.shape[1]})")
+    return index
+
+
+# -----------------------------------------------------------------------
+# Step 8: BM25 index
+# -----------------------------------------------------------------------
+def build_bm25_index(chunks):
+    tokenized = [c["text"].lower().split() for c in chunks]
+    print(f"   BM25 index: {len(tokenized)} chunks")
+    return BM25Okapi(tokenized)
+
+
+# -----------------------------------------------------------------------
+# Step 9: Heading-span linking
+# -----------------------------------------------------------------------
+def link_heading_spans(chunks):
+    current_heading_idx = None
+    linked = 0
+    for i, chunk in enumerate(chunks):
+        if chunk["type"] == "heading":
+            current_heading_idx = i
+        elif current_heading_idx is not None:
+            chunks[current_heading_idx]["links"].append({"id": i, "score": 1.0})
+            chunks[i]["links"].append({"id": current_heading_idx, "score": 1.0})
+            linked += 1
+    print(f"   Heading-span links created: {linked}")
+
+
+# -----------------------------------------------------------------------
+# Step 10: Hybrid retrieval (semantic + BM25)
+# Headings are EXCLUDED from retrieval — they exist only for context assembly
+# -----------------------------------------------------------------------
+def hybrid_retrieve(query, chunks, bm25, faiss_index, model,
+                    top_k=HYBRID_TOP_K, alpha=ALPHA):
+    n = len(chunks)
+
+    # BM25
+    bm25_scores = bm25.get_scores(query.lower().split())
+    bm25_norm   = bm25_scores / (bm25_scores.max() + 1e-9)
+
+    # Semantic
+    query_emb = model.encode([query]).astype("float32")
+    faiss.normalize_L2(query_emb)
+    raw_scores, indices = faiss_index.search(query_emb, n)
+
+    sem_norm = np.zeros(n)
+    for rank in range(len(indices[0])):
+        idx = indices[0][rank]
+        if 0 <= idx < n:
+            sem_norm[idx] = raw_scores[0][rank]
+
+    combined = alpha * sem_norm + (1 - alpha) * bm25_norm
+
+    # ---- KEY FIX: penalize headings so content chunks surface ----
+    for i, chunk in enumerate(chunks):
+        if chunk["type"] == "heading":
+            combined[i] *= 0.3   # 70% score penalty on headings
+
+    top_indices = np.argsort(combined)[::-1][:top_k]
+
+    print(f"\n🔀 Hybrid top-{top_k} (α={alpha}, headings penalized):")
+    for idx in top_indices:
+        c = chunks[idx]
+        print(f"   ID {c['id']:3d} | {c['type']:8s} | "
+              f"sem={sem_norm[idx]:.3f} bm25={bm25_norm[idx]:.3f} "
+              f"fused={combined[idx]:.3f} | pg {c['page']}")
+
+    return [chunks[i] for i in top_indices]
+
+
+# -----------------------------------------------------------------------
+# Step 11: Cross-encoder re-ranking
+# -----------------------------------------------------------------------
+def rerank_candidates(query, candidates, reranker):
+    pairs  = [(query, c["text"]) for c in candidates]
+    scores = reranker.predict(pairs)
+    ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+
+    print(f"\n🏆 Re-ranked:")
+    for score, c in ranked:
+        print(f"   ID {c['id']:3d} | {c['type']:8s} | "
+              f"rerank={score:6.3f} | pg {c['page']}"
+              + (f" | under: '{c['heading'][:40]}'" if c.get("heading") and c["type"] != "heading" else ""))
+
+    return [c for _, c in ranked]
+
+
+# -------------------------------
+# Section-level grouping
+# -------------------------------
+def group_by_heading(chunks):
+    sections = {}
+
+    for c in chunks:
+        heading = c.get("heading") or "NO_HEADING"
+
+        if heading not in sections:
+            sections[heading] = []
+
+        sections[heading].append(c)
+
+    return sections
+
+
+# -------------------------------
+# Section scoring (using reranker)
+# -------------------------------
+def score_section(section_chunks, query, reranker):
+    pairs = [(query, c["text"]) for c in section_chunks]
+    scores = reranker.predict(pairs)
+
+    return sum(scores) / len(scores)
+
+
+# -------------------------------
+# Select best section
+# -------------------------------
+def select_best_section(reranked_chunks, query, reranker):
+    sections = group_by_heading(reranked_chunks)
+
+    best_section = None
+    best_score = float("-inf")
+
+    print("\n📊 Section Scores:\n")
+
+    for heading, chunks in sections.items():
+        score = score_section(chunks, query, reranker)
+
+        print(f"→ {heading[:50]} | score={score:.3f}")
+
+        if score > best_score:
+            best_score = score
+            best_section = (heading, chunks)
+
+    return best_section
+
+
+# -----------------------------------------------------------------------
+# Step 12: Context assembly
+# Pull in parent heading + sibling content around each top chunk
+# -----------------------------------------------------------------------
+def assemble_context(top_chunks, chunks, max_chunks=CONTEXT_SIZE):
+    seen_ids = set()
+    context  = []
+
+    for chunk in top_chunks:
+        if len(context) >= max_chunks:
+            break
+
+        # Add heading first (for labeling)
+        for link in chunk["links"]:
+            linked = chunks[link["id"]]
+            if linked["type"] == "heading" and linked["id"] not in seen_ids:
+                context.append(linked)
+                seen_ids.add(linked["id"])
+
+        # Add the content chunk itself
+        if chunk["id"] not in seen_ids:
+            context.append(chunk)
+            seen_ids.add(chunk["id"])
+
+        # Add adjacent content siblings (same heading)
+        for link in chunk["links"]:
+            if len(context) >= max_chunks:
+                break
+            linked = chunks[link["id"]]
+            if linked["type"] in ("content", "bullet") and linked["id"] not in seen_ids:
+                context.append(linked)
+                seen_ids.add(linked["id"])
+
+    # Sort final context by document order (chunk ID = document order)
+    context.sort(key=lambda c: c["id"])
+    return context
+
+
+# -----------------------------------------------------------------------
+# Pipeline builders
+# -----------------------------------------------------------------------
+def build_pipeline(file_path):
+    raw_chunks = build_structured_chunks(file_path)
+
+    print("\n🧠 Loading embedding model...")
+    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+    print("\n🧠 Loading cross-encoder re-ranker...")
+    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+    print("\n🔢 Embedding chunks...")
+    chunks = embed_chunks(raw_chunks, embed_model)
+
+    print("\n🔗 Linking heading spans...")
+    link_heading_spans(chunks)
+
+    print_tree(chunks, limit=100)
+
+    print("\n📦 Building FAISS index...")
+    faiss_index = build_faiss_index(chunks)
+
+    print("\n📦 Building BM25 index...")
+    bm25_index = build_bm25_index(chunks)
+
+    return chunks, faiss_index, bm25_index, embed_model, reranker
+
+
+def query_pipeline(query, chunks, faiss_index, bm25_index, embed_model, reranker):
+    print(f"\n💬 Query: {query}")
+
+    candidates = hybrid_retrieve(query, chunks, bm25_index, faiss_index, embed_model)
+    reranked   = rerank_candidates(query, candidates, reranker)
+    # top_chunks = reranked[:RERANK_TOP_K]
+    # context    = assemble_context(top_chunks, chunks)
+    # return context
+    heading, best_chunks = select_best_section(reranked, query, reranker)
+
+    print(f"\n🏆 Selected Section: {heading}\n")
+
+    context = assemble_context(best_chunks, chunks)
+
+    return context
+
+
+
+
+def print_tree(chunks, limit=None):
+    print("\n🌳 DOCUMENT TREE STRUCTURE:\n")
+
+    tree = {}
+    
+    # Group chunks by heading
+    for c in chunks:
+        heading = c.get("heading") or "ROOT"
+
+        if heading not in tree:
+            tree[heading] = []
+
+        tree[heading].append(c)
+
+    count = 0
+
+    for heading, items in tree.items():
+        print(f"\n📂 {heading}\n")
+
+        for c in items:
+            if c["type"] == "heading":
+                continue
+
+            prefix = "   ├──"
+            if c["type"] == "bullet":
+                prefix = "   •"
+
+            print(f"{prefix} [ID {c['id']}] ({c['type']}) {c['text'][:100]}")
+
+            count += 1
+            if limit and count >= limit:
+                return
+
+# -----------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------
+if __name__ == "__main__":
+    file_path = r"C:\Users\karth\Downloads\j0_endgame_merged.pdf"
+
+    chunks, faiss_index, bm25_index, embed_model, reranker = build_pipeline(file_path)
+
+    print("\n" + "=" * 60)
+    print("RAG Pipeline Ready. Type 'exit' to quit.")
+    print("=" * 60)
+
+    while True:
+        query = input("\n💬 Enter query: ").strip()
+        if query.lower() in ("exit", "quit", "q"):
+            print("👋 Exiting.")
+            break
+        if not query:
+            continue
+
+        context = query_pipeline(query, chunks, faiss_index, bm25_index, embed_model, reranker)
+
+        print("\n📦 RETRIEVED CONTEXT:\n" + "=" * 60)
+        for c in context:
+            label = f"[ID {c['id']}] [{c['type'].upper()}] [Page {c['page']}]"
+            if c.get("heading") and c["type"] != "heading":
+                label += f" ← '{c['heading'][:50]}'"
+            print(label)
+            print(c["text"][:500])
+            print("-" * 60)
+
+        print("\n✅ Done.")
+
+
+================================================================================
+FILE: .vscode\settings.json
+================================================================================
+
+{
+    "kiroAgent.configureMCP": "Disabled"
+}
+
+
+================================================================================
+FILE: backend\main.py
+================================================================================
+
+# backend/main.py
+import os
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from backend.api.routes import router
+from backend.db.database import init_db
+
+app = FastAPI(title="DocuMind API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "images")
+os.makedirs(ASSETS_DIR, exist_ok=True)
+app.mount("/assets/images", StaticFiles(directory=ASSETS_DIR), name="images")
+
+app.include_router(router)
+
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+
+================================================================================
+FILE: backend\__init__.py
+================================================================================
+
+﻿
+
+
+
+================================================================================
+FILE: backend\api\routes.py
+================================================================================
+
+# backend/api/routes.py
+import os, shutil, uuid
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from pydantic import BaseModel
+from typing import List
+from sqlalchemy.orm import Session
+import bcrypt
+
+from backend.auth.jwt_handler import create_token, get_current_user
+from backend.services.rag_service import run_query, preload_retriever
+from backend.db.database import get_db, User
+
+router = APIRouter()
+
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+# ── /register ─────────────────────────────────────────────────────────────────
+class AuthRequest(BaseModel):
+    username: str
+    password: str
+
+
+@router.post("/register", status_code=201)
+def register(req: AuthRequest, db: Session = Depends(get_db)):
+    if not req.username.strip() or not req.password:
+        raise HTTPException(400, "Username and password are required.")
+    if db.query(User).filter(User.username == req.username.strip()).first():
+        raise HTTPException(409, "Username already taken.")
+    hashed = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+    db.add(User(username=req.username.strip(), password_hash=hashed))
+    db.commit()
+    return {"message": "Account created successfully."}
+
+
+# ── /login ────────────────────────────────────────────────────────────────────
+@router.post("/login")
+def login(req: AuthRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == req.username.strip()).first()
+    if not user or not bcrypt.checkpw(req.password.encode(), user.password_hash.encode()):
+        raise HTTPException(401, "Invalid username or password.")
+    token = create_token(user.id, user.username)
+    return {"username": user.username, "token": token}
+
+
+# ── /upload ───────────────────────────────────────────────────────────────────
+@router.post("/upload")
+async def upload_pdf(
+    file:    UploadFile = File(...),
+    chat_id: str = "default",
+    current_user: dict = Depends(get_current_user),
+):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files are accepted.")
+
+    file_id   = str(uuid.uuid4())
+    safe_name = f"{file_id}_{file.filename}"
+    dest      = os.path.join(UPLOAD_DIR, safe_name)
+
+    with open(dest, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    try:
+        preload_retriever(current_user["user_id"], chat_id, dest)
+    except Exception as e:
+        print(f"[upload] Preload warning: {e}")
+
+    return {"id": file_id, "name": file.filename, "path": dest}
+
+
+# ── /query ────────────────────────────────────────────────────────────────────
+class QueryRequest(BaseModel):
+    query:   str
+    pdfs:    List[str]
+    chat_id: str
+
+
+@router.post("/query")
+async def query_endpoint(
+    req: QueryRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    if not req.pdfs:
+        raise HTTPException(400, "At least one PDF path is required.")
+    if len(req.pdfs) > 2:
+        raise HTTPException(400, "Maximum 2 PDFs supported.")
+    for p in req.pdfs:
+        if not os.path.isfile(p):
+            raise HTTPException(404, f"PDF not found on server: {p}")
+
+    try:
+        result = run_query(current_user["user_id"], req.chat_id, req.query, req.pdfs)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+    answer      = result.get("answer", "")
+    doc1_answer = doc2_answer = comparison = ""
+
+    if len(req.pdfs) == 2:
+        doc1_answer = _extract_section(answer, "[Doc1 Answer]", "[Doc2 Answer]")
+        doc2_answer = _extract_section(answer, "[Doc2 Answer]", "[Comparison]")
+        comparison  = _extract_section(answer, "[Comparison]", None)
+
+    images, tables = _collect_visuals(result.get("visuals", ""), result.get("raw_tables", []))
+
+    return {
+        "answer":      answer,
+        "doc1_answer": doc1_answer,
+        "doc2_answer": doc2_answer,
+        "comparison":  comparison,
+        "visuals":     result.get("visuals", ""),
+        "images":      images,
+        "tables":      tables,
+        "relation":    result.get("relation", ""),
+        "similarity":  result.get("similarity", 0),
+    }
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+def _extract_section(text: str, start_tag: str, end_tag: str | None) -> str:
+    try:
+        s = text.index(start_tag) + len(start_tag)
+        e = text.index(end_tag) if end_tag and end_tag in text else len(text)
+        return text[s:e].strip()
+    except ValueError:
+        return ""
+
+
+def _collect_visuals(visuals_text: str, raw_tables: list):
+    """Extract image paths from visuals text; use raw_tables for structured data."""
+    images = []
+    for line in visuals_text.splitlines():
+        line = line.strip()
+        if line.startswith("📷 Image:"):
+            images.append(line.replace("📷 Image:", "").strip())
+    # raw_tables is already List[List[List[str]]] — pass through directly
+    return images, raw_tables
+
+
+
+================================================================================
+FILE: backend\api\__init__.py
+================================================================================
+
+﻿
+
+
+
+================================================================================
+FILE: backend\auth\jwt_handler.py
+================================================================================
+
+# backend/auth/jwt_handler.py
+import os
+from datetime import datetime, timedelta, timezone
+from jose import JWTError, jwt
+from fastapi import HTTPException, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+SECRET_KEY = os.environ.get("DOCUMIND_SECRET", "documind-dev-secret-change-in-prod")
+ALGORITHM  = "HS256"
+EXPIRE_HOURS = 24 * 7   # 7 days
+
+_bearer = HTTPBearer(auto_error=True)
+
+
+def create_token(user_id: int, username: str) -> str:
+    payload = {
+        "sub":      str(user_id),
+        "username": username,
+        "exp":      datetime.now(timezone.utc) + timedelta(hours=EXPIRE_HOURS),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def _decode(token: str) -> dict:
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+
+
+def get_current_user(creds: HTTPAuthorizationCredentials = Security(_bearer)) -> dict:
+    """FastAPI dependency — returns {"user_id": int, "username": str}."""
+    payload = _decode(creds.credentials)
+    return {"user_id": int(payload["sub"]), "username": payload["username"]}
+
+
+
+================================================================================
+FILE: backend\auth\__init__.py
+================================================================================
+
+﻿
+
+
+
+================================================================================
+FILE: backend\core\pipeline.py
+================================================================================
+
+# backend/core/pipeline.py
+# Orchestrates the full RAG flow:
+#   User Query → Retrieval → Context → Prompt → LLM → Answer → Memory Update
+
+from backend.retrieval.retriever import Retriever
+from backend.memory.memory import MemoryManager
+from backend.memory.relation import RelationClassifier
+from backend.memory.processor import MemoryProcessor
+from backend.prompting.prompt_builder import PromptBuilder
+from backend.llm.llm_service import LLMService
+from backend.utils.formatter import format_context, format_visuals
+
+
+class RAGPipeline:
+    def __init__(self, pdf1: str, pdf2: str = None, extract_visuals: bool = True):
+        """
+        pdf1            - path to first (or only) PDF
+        pdf2            - optional path to second PDF for dual-document comparison
+        extract_visuals - whether to extract images/tables and attach to chunks
+        """
+        self.retriever1 = Retriever(pdf1, extract_visuals=extract_visuals)
+        self.retriever2 = Retriever(pdf2, extract_visuals=extract_visuals) if pdf2 else None
+
+        self.memory = MemoryManager()
+        self.classifier = RelationClassifier(self.retriever1.embed_model)
+        self.processor = MemoryProcessor()
+        self.prompt_builder = PromptBuilder()
+        self.llm = LLMService()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def query(self, user_query: str) -> dict:
+        """
+        Run a single query through the full pipeline.
+
+        Returns a dict with:
+            answer      - LLM response string
+            context     - formatted context string used in prompt
+            visuals     - formatted visual summary (images + tables)
+            similarity  - float, embedding similarity to previous query
+            relation    - "HIGH" | "MEDIUM" | "LOW"
+        """
+        # Step 1: memory
+        prev_q, prev_ans, _ = self.memory.get()
+
+        # Step 2: relation classification
+        relation_level, similarity = self.classifier.classify(prev_q, user_query)
+
+        # Step 3: key-point extraction from previous answer
+        key_points = None
+        if relation_level in ("HIGH", "MEDIUM") and prev_ans:
+            key_points = self.processor.extract_key_points(prev_ans)
+
+        # Step 4: retrieval
+        if self.retriever2:
+            chunks_a = self.retriever1.retrieve(user_query)
+            chunks_b = self.retriever2.retrieve(user_query)
+            context_a = format_context(chunks_a)
+            context_b = format_context(chunks_b)
+            merged_context = f"--- DOCUMENT 1 ---\n{context_a}\n\n--- DOCUMENT 2 ---\n{context_b}"
+            all_chunks = chunks_a + chunks_b
+        else:
+            chunks = self.retriever1.retrieve(user_query)
+            merged_context = format_context(chunks)
+            context_a = context_b = None
+            all_chunks = chunks
+
+        # Step 5: visuals summary (printed, not sent to LLM)
+        visuals_summary = format_visuals(all_chunks)
+
+        # Step 6: build prompt
+        if self.retriever2:
+            prompt = self.prompt_builder.build_dual(user_query, context_a, context_b, key_points)
+        else:
+            prompt = self.prompt_builder.build_single(user_query, merged_context, key_points)
+
+        # Step 7: LLM
+        answer = self.llm.run(prompt)
+
+        # Step 8: update memory
+        curr_emb = self.retriever1.embed_query(user_query)
+        self.memory.update(user_query, answer, curr_emb)
+
+        return {
+            "answer": answer,
+            "context": merged_context,
+            "visuals": visuals_summary,
+            "similarity": similarity,
+            "relation": relation_level,
+        }
+
+
+
+================================================================================
+FILE: backend\core\__init__.py
+================================================================================
+
+﻿
+
+
+
+================================================================================
+FILE: backend\db\database.py
+================================================================================
+
+# backend/db/database.py
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+DB_PATH = "documind.db"
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+
+class User(Base):
+    __tablename__ = "users"
+    id            = Column(Integer, primary_key=True, index=True)
+    username      = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+
+================================================================================
+FILE: backend\db\__init__.py
+================================================================================
+
+﻿
+
+
+
+================================================================================
+FILE: backend\ingestion\parser.py
+================================================================================
+
+# backend/ingestion/parser.py
+# Wraps ut.py's build_structured_chunks + embed_chunks + index builders.
+# All chunking logic lives in ut.py — this module only orchestrates it.
+
+import sys
+import os
+
+# Allow importing from project root (where ut.py lives)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+from ut import (
+    build_structured_chunks,
+    embed_chunks,
+    build_faiss_index,
+    build_bm25_index,
+    link_heading_spans,
+    print_tree,
+)
+from sentence_transformers import SentenceTransformer, CrossEncoder
+
+
+def parse_and_index(file_path: str):
+    """
+    Full ingestion pipeline for a single PDF.
+
+    Returns:
+        chunks      - list of chunk dicts (with embeddings)
+        faiss_index - FAISS IndexFlatIP
+        bm25_index  - BM25Okapi
+        embed_model - SentenceTransformer
+        reranker    - CrossEncoder
+    """
+    raw_chunks = build_structured_chunks(file_path)
+
+    print("\n🧠 Loading embedding model...")
+    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+    print("\n🧠 Loading cross-encoder re-ranker...")
+    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+    print("\n🔢 Embedding chunks...")
+    chunks = embed_chunks(raw_chunks, embed_model)
+
+    print("\n🔗 Linking heading spans...")
+    link_heading_spans(chunks)
+
+    print_tree(chunks, limit=100)
+
+    print("\n📦 Building FAISS index...")
+    faiss_index = build_faiss_index(chunks)
+
+    print("\n📦 Building BM25 index...")
+    bm25_index = build_bm25_index(chunks)
+
+    return chunks, faiss_index, bm25_index, embed_model, reranker
+
+
+
+================================================================================
+FILE: backend\ingestion\visual_extractor.py
+================================================================================
+
+# backend/ingestion/visual_extractor.py
+# Extracts images and tables from a PDF and attaches them to chunks by page.
+# Does NOT modify chunking logic — only extends chunk metadata.
+
+import os
+from typing import List, Dict
+
+import fitz          # PyMuPDF
+import pdfplumber
+
+
+ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "images")
+
+# Images smaller than this (in either dimension) are treated as icons and skipped
+MIN_IMAGE_PX = 60
+
+# Header/footer zone: images whose top edge is within this many points of the
+# page top, or whose bottom edge is within this many points of the page bottom,
+# are considered decorative and skipped.
+HEADER_FOOTER_MARGIN = 80
+
+
+# ---------------------------------------------------------------------------
+# Image extraction  (header/footer + tiny-image filtering)
+# ---------------------------------------------------------------------------
+
+def extract_images(file_path: str, assets_dir: str = ASSETS_DIR) -> List[Dict]:
+    """
+    Extract content images from a PDF using PyMuPDF.
+    Skips images located in the header/footer zone and very small icons.
+
+    Returns:
+        List of { "page": int, "path": str }
+    """
+    os.makedirs(assets_dir, exist_ok=True)
+    results = []
+    skipped = 0
+
+    doc = fitz.open(file_path)
+    pdf_name = os.path.splitext(os.path.basename(file_path))[0]
+
+    for page_num in range(len(doc)):
+        page       = doc[page_num]
+        page_h     = page.rect.height
+        image_list = page.get_images(full=True)
+
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+
+            # ── Position filter ──────────────────────────────────────────────
+            try:
+                rects = page.get_image_rects(xref)
+            except Exception:
+                rects = []
+
+            in_header_footer = False
+            if rects:
+                bbox = rects[0]          # fitz.Rect
+                y_top    = bbox.y0
+                y_bottom = bbox.y1
+                width    = bbox.width
+                height   = bbox.height
+
+                # Skip header/footer zone
+                if y_top < HEADER_FOOTER_MARGIN or y_bottom > page_h - HEADER_FOOTER_MARGIN:
+                    in_header_footer = True
+
+                # Skip tiny icons
+                if width < MIN_IMAGE_PX or height < MIN_IMAGE_PX:
+                    in_header_footer = True
+
+            if in_header_footer:
+                skipped += 1
+                continue
+
+            # ── Extract & save ───────────────────────────────────────────────
+            try:
+                base_image   = doc.extract_image(xref)
+                image_bytes  = base_image["image"]
+                ext          = base_image["ext"]
+            except Exception:
+                continue
+
+            filename  = f"{pdf_name}_p{page_num + 1}_img{img_index + 1}.{ext}"
+            save_path = os.path.join(assets_dir, filename)
+
+            with open(save_path, "wb") as f:
+                f.write(image_bytes)
+
+            results.append({"page": page_num + 1, "path": save_path})
+
+    doc.close()
+    print(f"   Extracted {len(results)} images ({skipped} header/footer/icon skipped) "
+          f"from '{os.path.basename(file_path)}'")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Table extraction
+# ---------------------------------------------------------------------------
+
+def extract_tables(file_path: str) -> List[Dict]:
+    """
+    Extract all tables from a PDF using pdfplumber.
+
+    Returns:
+        List of { "page": int, "data": List[List] }
+    """
+    results = []
+
+    with pdfplumber.open(file_path) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            tables = page.extract_tables()
+            for table in tables:
+                if table:
+                    results.append({
+                        "page": page_num + 1,
+                        "data": table,
+                    })
+
+    print(f"   Extracted {len(results)} tables from '{os.path.basename(file_path)}'")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Attach visuals to chunks by page number
+# ---------------------------------------------------------------------------
+
+def attach_visuals_to_chunks(chunks: List[Dict], images: List[Dict], tables: List[Dict]) -> List[Dict]:
+    """
+    Attach image and table metadata to each chunk based on matching page number.
+    Mutates chunks in-place and returns them.
+    """
+    # Build page-keyed lookup maps
+    images_by_page: Dict[int, List[Dict]] = {}
+    for img in images:
+        images_by_page.setdefault(img["page"], []).append(img)
+
+    tables_by_page: Dict[int, List[Dict]] = {}
+    for tbl in tables:
+        tables_by_page.setdefault(tbl["page"], []).append(tbl)
+
+    for chunk in chunks:
+        page = chunk.get("page", -1)
+        chunk["images"] = images_by_page.get(page, [])
+        chunk["tables"] = tables_by_page.get(page, [])
+
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# Convenience: run full visual extraction and attach in one call
+# ---------------------------------------------------------------------------
+
+def enrich_chunks_with_visuals(file_path: str, chunks: List[Dict]) -> List[Dict]:
+    """
+    Extract images + tables from file_path and attach to chunks by page.
+    """
+    print("\n🖼️  Extracting visuals...")
+    images = extract_images(file_path)
+    tables = extract_tables(file_path)
+    attach_visuals_to_chunks(chunks, images, tables)
+    print(f"   Visual enrichment complete.")
+    return chunks
+
+
+
+================================================================================
+FILE: backend\ingestion\__init__.py
+================================================================================
+
+﻿
+
+
+
+================================================================================
+FILE: backend\llm\llm_service.py
+================================================================================
+
+# backend/llm/llm_service.py
+# Identical behaviour to base_pipeline/llm_chain.py.
+
+from langchain_community.llms import Ollama
+
+
+class LLMService:
+    def __init__(self, model_name: str = "mistral"):
+        self.llm = Ollama(model=model_name)
+
+    def run(self, prompt: str) -> str:
+        return self.llm.invoke(prompt)
+
+
+
+================================================================================
+FILE: backend\llm\__init__.py
+================================================================================
+
+﻿
+
+
+
+================================================================================
+FILE: backend\memory\memory.py
+================================================================================
+
+# backend/memory/memory.py
+# Identical behaviour to base_pipeline/memory_manager.py.
+
+class MemoryManager:
+    def __init__(self):
+        self.prev_query = None
+        self.prev_answer = None
+        self.prev_embedding = None
+
+    def update(self, query: str, answer: str, embedding):
+        self.prev_query = query
+        self.prev_answer = answer
+        self.prev_embedding = embedding
+
+    def get(self):
+        return self.prev_query, self.prev_answer, self.prev_embedding
+
+
+
+================================================================================
+FILE: backend\memory\processor.py
+================================================================================
+
+# backend/memory/processor.py
+# Identical behaviour to base_pipeline/memory_processor.py.
+
+from langchain_community.llms import Ollama
+
+
+class MemoryProcessor:
+    def __init__(self, model_name: str = "mistral"):
+        self.llm = Ollama(model=model_name)
+
+    def extract_key_points(self, answer: str) -> str:
+        if not answer:
+            return ""
+        prompt = f"""
+Extract key points from the following answer as bullet points:
+
+{answer}
+"""
+        return self.llm.invoke(prompt)
+
+
+
+================================================================================
+FILE: backend\memory\relation.py
+================================================================================
+
+# backend/memory/relation.py
+# Identical behaviour to base_pipeline/relation_classifier.py.
+
+import numpy as np
+
+
+class RelationClassifier:
+    def __init__(self, embed_model, high_threshold: float = 0.6, low_threshold: float = 0.4):
+        self.embed_model = embed_model
+        self.high_threshold = high_threshold
+        self.low_threshold = low_threshold
+
+    def _cosine_sim(self, a, b) -> float:
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+    def classify(self, prev_q, curr_q):
+        """
+        Returns ("HIGH"|"MEDIUM"|"LOW", similarity_float)
+        """
+        if not prev_q:
+            return "LOW", 0.0
+
+        prev_emb = self.embed_model.encode([prev_q])[0]
+        curr_emb = self.embed_model.encode([curr_q])[0]
+        sim = self._cosine_sim(prev_emb, curr_emb)
+
+        if sim >= self.high_threshold:
+            return "HIGH", sim
+        elif sim >= self.low_threshold:
+            return "MEDIUM", sim
+        else:
+            return "LOW", sim
+
+
+
+================================================================================
+FILE: backend\memory\__init__.py
+================================================================================
+
+﻿
+
+
+
+================================================================================
+FILE: backend\models\schema.py
+================================================================================
+
+# backend/models/schema.py
+# Defines the core data structures used throughout the pipeline.
+
+from dataclasses import dataclass, field
+from typing import Any, List, Optional
+
+
+@dataclass
+class ImageMeta:
+    page: int
+    path: str
+
+
+@dataclass
+class TableMeta:
+    page: int
+    data: List[List[Any]]
+
+
+@dataclass
+class Chunk:
+    id: int
+    text: str
+    type: str          # "heading" | "content" | "bullet"
+    page: int
+    heading: Optional[str]
+    embedding: Any     # np.ndarray float32
+    length: int
+    links: List[dict] = field(default_factory=list)
+    images: List[ImageMeta] = field(default_factory=list)
+    tables: List[TableMeta] = field(default_factory=list)
+
+
+
+================================================================================
+FILE: backend\models\__init__.py
+================================================================================
+
+﻿
+
+
+
+================================================================================
+FILE: backend\prompting\prompt_builder.py
+================================================================================
+
+# backend/prompting/prompt_builder.py
+
+class PromptBuilder:
+
+    def build_single(self, query: str, context: str, previous_summary: str = None) -> str:
+        prev_block = f"""
+Previous context (for reference, use only if relevant):
+{previous_summary}
+""" if previous_summary else ""
+
+        return f"""You are a research assistant.
+
+Rules:
+- Answer ONLY using the provided context.
+- Do NOT add external knowledge.
+- Only answer using the provided context. If insufficient information is available, provide the best possible answer based strictly on the given context without explicitly stating that information is missing.
+- Be clear and concise.
+{prev_block}
+Context:
+{context}
+
+Question:
+{query}
+
+Answer:"""
+
+    def build_dual(self, query: str, context_a: str, context_b: str, previous_summary: str = None) -> str:
+        prev_block = f"""
+Previous context (for reference, use only if relevant):
+{previous_summary}
+""" if previous_summary else ""
+
+        return f"""You are a research assistant working with TWO separate documents.
+
+Rules:
+- Treat both documents independently.
+- Do NOT mix information between documents.
+- Use ONLY the given context.
+- Do NOT add external knowledge.
+- Only answer using the provided context. If insufficient information is available, provide the best possible answer based strictly on the given context without explicitly stating that information is missing.
+{prev_block}
+--- DOCUMENT 1 ---
+{context_a}
+
+--- DOCUMENT 2 ---
+{context_b}
+
+Question:
+{query}
+
+Answer in this exact format:
+
+[Doc1 Answer]
+<answer using only Document 1>
+
+[Doc2 Answer]
+<answer using only Document 2>
+
+[Comparison]
+<similarities, differences, which is more detailed>"""
+
+
+
+================================================================================
+FILE: backend\prompting\__init__.py
+================================================================================
+
+﻿
+
+
+
+================================================================================
+FILE: backend\retrieval\retriever.py
+================================================================================
+
+# backend/retrieval/retriever.py
+# Wraps the retrieval pipeline. Identical behaviour to base_pipeline/retrieval_wrapper.py.
+
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+from ut import query_pipeline
+from backend.ingestion.parser import parse_and_index
+from backend.ingestion.visual_extractor import enrich_chunks_with_visuals
+
+
+class Retriever:
+    def __init__(self, file_path: str, extract_visuals: bool = True):
+        self.file_path = file_path
+        self.chunks, self.faiss, self.bm25, self.embed_model, self.reranker = parse_and_index(file_path)
+
+        if extract_visuals:
+            enrich_chunks_with_visuals(file_path, self.chunks)
+
+    def retrieve(self, query: str):
+        return query_pipeline(
+            query,
+            self.chunks,
+            self.faiss,
+            self.bm25,
+            self.embed_model,
+            self.reranker,
+        )
+
+    def embed_query(self, query: str):
+        return self.embed_model.encode([query])[0]
+
+
+
+================================================================================
+FILE: backend\retrieval\__init__.py
+================================================================================
+
+﻿
+
+
+
+================================================================================
+FILE: backend\services\rag_service.py
+================================================================================
+
+# backend/services/rag_service.py
+# Retriever cache is scoped by (user_id, chat_id, pdf_path).
+# Same chat_id across different users never collides.
+
+import sys, os, re
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+from backend.retrieval.retriever import Retriever
+from backend.memory.memory import MemoryManager
+from backend.memory.relation import RelationClassifier
+from backend.memory.processor import MemoryProcessor
+from backend.prompting.prompt_builder import PromptBuilder
+from backend.llm.llm_service import LLMService
+from backend.utils.formatter import format_context, format_visuals
+
+# ── Caches ────────────────────────────────────────────────────────────────────
+# { user_id: { chat_id: { pdf_path: Retriever } } }
+_retriever_cache: dict[int, dict[str, dict[str, Retriever]]] = {}
+
+# { user_id: { chat_id: { memory, classifier, ... } } }
+_chat_sessions: dict[int, dict[str, dict]] = {}
+
+# ── "Not found" scrubber ──────────────────────────────────────────────────────
+_NOT_FOUND_RE = re.compile(
+    r"not found in (the|that) document[s]?\.?"
+    r"|(?:the|that) document[s]? (?:does|do) not (?:contain|mention|include|provide)[^.]*\."
+    r"|(?:no|the) (?:relevant |specific )?(?:information|answer|detail|content|data)"
+      r" (?:is )?(?:available|found|present|provided) in (?:the|that) document[s]?\.?"
+    r"|(?:this|the) (?:information|topic|question) is not"
+      r" (?:covered|addressed|discussed) in (?:the|that) document[s]?\.?",
+    flags=re.IGNORECASE,
+)
+
+
+def _clean(text: str) -> str:
+    cleaned = _NOT_FOUND_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get_retriever(user_id: int, chat_id: str, pdf_path: str) -> Retriever:
+    user_cache = _retriever_cache.setdefault(user_id, {})
+    chat_cache = user_cache.setdefault(chat_id, {})
+    if pdf_path not in chat_cache:
+        print(f"[cache] BUILD  user={user_id} chat={chat_id} pdf={os.path.basename(pdf_path)}")
+        chat_cache[pdf_path] = Retriever(pdf_path, extract_visuals=True)
+    else:
+        print(f"[cache] REUSE  user={user_id} chat={chat_id} pdf={os.path.basename(pdf_path)}")
+    return chat_cache[pdf_path]
+
+
+def _get_session(user_id: int, chat_id: str, embed_model) -> dict:
+    user_sessions = _chat_sessions.setdefault(user_id, {})
+    if chat_id not in user_sessions:
+        user_sessions[chat_id] = {
+            "memory":         MemoryManager(),
+            "classifier":     RelationClassifier(embed_model),
+            "processor":      MemoryProcessor(),
+            "prompt_builder": PromptBuilder(),
+            "llm":            LLMService(),
+        }
+    return user_sessions[chat_id]
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def preload_retriever(user_id: int, chat_id: str, pdf_path: str) -> None:
+    """Eagerly index on upload so first query is instant."""
+    _get_retriever(user_id, chat_id, pdf_path)
+
+
+def run_query(user_id: int, chat_id: str, query: str, pdf_paths: list[str]) -> dict:
+    r1 = _get_retriever(user_id, chat_id, pdf_paths[0])
+    r2 = _get_retriever(user_id, chat_id, pdf_paths[1]) if len(pdf_paths) == 2 else None
+
+    sess          = _get_session(user_id, chat_id, r1.embed_model)
+    memory        = sess["memory"]
+    classifier    = sess["classifier"]
+    processor     = sess["processor"]
+    prompt_builder = sess["prompt_builder"]
+    llm           = sess["llm"]
+
+    prev_q, prev_ans, _ = memory.get()
+    relation_level, similarity = classifier.classify(prev_q, query)
+
+    key_points = None
+    if relation_level in ("HIGH", "MEDIUM") and prev_ans:
+        key_points = processor.extract_key_points(prev_ans)
+
+    if r2:
+        chunks_a  = r1.retrieve(query)
+        chunks_b  = r2.retrieve(query)
+        context_a = format_context(chunks_a)
+        context_b = format_context(chunks_b)
+        all_chunks = chunks_a + chunks_b
+        prompt    = prompt_builder.build_dual(query, context_a, context_b, key_points)
+        merged    = f"--- DOCUMENT 1 ---\n{context_a}\n\n--- DOCUMENT 2 ---\n{context_b}"
+    else:
+        chunks    = r1.retrieve(query)
+        context_a = format_context(chunks)
+        context_b = None
+        all_chunks = chunks
+        prompt    = prompt_builder.build_single(query, context_a, key_points)
+        merged    = context_a
+
+    visuals = format_visuals(all_chunks)
+    answer  = _clean(llm.run(prompt))
+
+    memory.update(query, answer, r1.embed_query(query))
+
+    # Collect structured table data from retrieved chunks
+    raw_tables = []
+    for chunk in all_chunks:
+        for tbl in chunk.get("tables", []):
+            data = tbl.get("data")
+            if data:
+                raw_tables.append(data)
+
+    return {
+        "answer":     answer,
+        "context":    merged,
+        "visuals":    visuals,
+        "raw_tables": raw_tables,
+        "similarity": float(similarity),
+        "relation":   relation_level,
+    }
+
+
+
+================================================================================
+FILE: backend\services\__init__.py
+================================================================================
+
+﻿
+
+
+
+================================================================================
+FILE: backend\utils\formatter.py
+================================================================================
+
+# backend/utils/formatter.py
+# Formats retrieved chunks into a plain-text context string for the prompt.
+
+from typing import List
+
+
+def format_context(chunks: List[dict]) -> str:
+    lines = []
+    for c in chunks:
+        if c["type"] == "heading":
+            lines.append(f"\n### {c['text']}\n")
+        else:
+            lines.append(c["text"])
+    return "\n".join(lines)
+
+
+def format_visuals(chunks: List[dict]) -> str:
+    """Return a human-readable summary of images and tables attached to chunks."""
+    lines = []
+    for c in chunks:
+        images = c.get("images", [])
+        tables = c.get("tables", [])
+        if images or tables:
+            lines.append(f"\n[Page {c['page']} | Chunk ID {c['id']}]")
+            for img in images:
+                lines.append(f"  📷 Image: {img['path']}")
+            for tbl in tables:
+                lines.append(f"  📊 Table ({len(tbl['data'])} rows):")
+                for row in tbl["data"][:5]:   # preview first 5 rows
+                    lines.append(f"       {row}")
+    return "\n".join(lines) if lines else ""
+
+
+
+================================================================================
+FILE: backend\utils\__init__.py
+================================================================================
+
+﻿
+
+
+
+================================================================================
+FILE: base_pipeline\llm_chain.py
+================================================================================
+
+# llm_chain.py
+
+from langchain_community.llms import Ollama
+
+class LLMChainWrapper:
+    def __init__(self, model_name="mistral"):
+        self.llm = Ollama(model=model_name)
+
+    def run(self, prompt):
+        return self.llm.invoke(prompt)
+
+
+================================================================================
+FILE: base_pipeline\main.py
+================================================================================
+
+# # main.py
+
+# from retrieval_wrapper import RetrievalWrapper
+# from memory_manager import MemoryManager
+# from relation_classifier import RelationClassifier
+# from memory_processor import MemoryProcessor
+# from prompt_builder import PromptBuilder
+# from llm_chain import LLMChainWrapper
+# from utils import format_context
+
+# # FILE_PATH = input("Enter PDF path: ")
+
+# # retriever = RetrievalWrapper(FILE_PATH)
+
+# pdf1 = input("Enter first PDF path: ").strip()
+# pdf2 = input("Enter second PDF path (or press Enter to skip): ").strip()
+
+# retriever1 = RetrievalWrapper(pdf1)
+# retriever2 = RetrievalWrapper(pdf2) if pdf2 else None
+
+# memory = MemoryManager()
+# classifier = RelationClassifier(retriever.embed_model)
+# processor = MemoryProcessor()
+# prompt_builder = PromptBuilder()
+# llm = LLMChainWrapper()
+
+# print("\nSystem Ready. Type 'exit' to quit.\n")
+
+# while True:
+#     query = input("💬 Query: ").strip()
+#     if query.lower() == "exit":
+#         break
+
+#     # prev_q, prev_ans = memory.get()
+#     prev_q, prev_ans, prev_emb = memory.get()
+
+#     # Step 1: classify relation
+#     # relation = classifier.classify(prev_q, query)
+#     relation_level, similarity = classifier.classify(prev_q, query)
+#     # print(f"\n🔗 Relation: {relation}")
+#     print(f"\n🔗 Similarity: {similarity:.3f} | Level: {relation_level}")
+
+#     # Step 2: retrieve context
+#     context_chunks = retriever.retrieve(query)
+#     context = format_context(context_chunks)
+
+#     # Step 3: process memory
+#     key_points = None
+#     # if relation != "UNRELATED" and prev_ans:
+#     #     key_points = processor.extract_key_points(prev_ans)
+#     if relation_level in ["HIGH", "MEDIUM"] and prev_ans:
+#         key_points = processor.extract_key_points(prev_ans)
+#     else:
+#         key_points = None
+
+#     # Step 4: build prompt
+#     prompt = prompt_builder.build(query, context, key_points)
+
+#     # Step 5: LLM answer
+#     answer = llm.run(prompt)
+
+#     print("\n🤖 Answer:\n", answer)
+
+#     # Step 6: update memory
+#     memory.update(query, answer)
+
+
+
+
+
+# main.py
+
+from retrieval_wrapper import RetrievalWrapper
+from memory_manager import MemoryManager
+from relation_classifier import RelationClassifier
+from memory_processor import MemoryProcessor
+from prompt_builder import PromptBuilder
+from llm_chain import LLMChainWrapper
+from utils import format_context
+
+# -------------------------------
+# Input PDFs
+# -------------------------------
+pdf1 = input("Enter first PDF path: ").strip()
+pdf2 = input("Enter second PDF path (or press Enter to skip): ").strip()
+
+retriever1 = RetrievalWrapper(pdf1)
+retriever2 = RetrievalWrapper(pdf2) if pdf2 else None
+
+# -------------------------------
+# Initialize components
+# -------------------------------
+memory = MemoryManager()
+classifier = RelationClassifier(retriever1.embed_model)  # ✅ FIXED
+processor = MemoryProcessor()
+prompt_builder = PromptBuilder()
+llm = LLMChainWrapper()
+
+print("\nSystem Ready. Type 'exit' to quit.\n")
+
+# -------------------------------
+# Query Loop
+# -------------------------------
+while True:
+    query = input("💬 Query: ").strip()
+    if query.lower() == "exit":
+        break
+
+    # Step 1: Get memory
+    prev_q, prev_ans, prev_emb = memory.get()
+
+    # Step 2: relation (embedding-based)
+    relation_level, similarity = classifier.classify(prev_q, query)
+    print(f"\n🔗 Similarity: {similarity:.3f} | Level: {relation_level}")
+
+    # Step 3: process memory
+    key_points = None
+    if relation_level in ["HIGH", "MEDIUM"] and prev_ans:
+        key_points = processor.extract_key_points(prev_ans)
+
+    # -------------------------------
+    # Step 4: Retrieval
+    # -------------------------------
+    if retriever2:
+        context_a_chunks = retriever1.retrieve(query)
+        context_b_chunks = retriever2.retrieve(query)
+
+        context_a = format_context(context_a_chunks)
+        context_b = format_context(context_b_chunks)
+
+        merged_context = f"""
+--- DOCUMENT 1 ---
+{context_a}
+
+--- DOCUMENT 2 ---
+{context_b}
+"""
+    else:
+        context_chunks = retriever1.retrieve(query)
+        merged_context = format_context(context_chunks)
+
+    # -------------------------------
+    # Step 5: Prompt (FIXED)
+    # -------------------------------
+    if retriever2:
+        prompt = prompt_builder.build_dual(
+            query,
+            context_a,
+            context_b,
+            key_points
+        )
+    else:
+        prompt = prompt_builder.build_single(
+            query,
+            merged_context,
+            key_points
+        )
+
+    # -------------------------------
+    # Step 6: LLM
+    # -------------------------------
+    answer = llm.run(prompt)
+
+    print("\n🤖 Answer:\n")
+    print(answer)
+    print("\n" + "=" * 60)
+
+    # -------------------------------
+    # Step 7: Update memory
+    # -------------------------------
+    curr_emb = retriever1.embed_query(query)
+    memory.update(query, answer, curr_emb)
+
+
+================================================================================
+FILE: base_pipeline\memory_manager.py
+================================================================================
+
+# # memory_manager.py
+
+# class MemoryManager:
+#     def __init__(self):
+#         self.prev_query = None
+#         self.prev_answer = None
+
+#     def update(self, query, answer):
+#         self.prev_query = query
+#         self.prev_answer = answer
+
+#     def get(self):
+#         return self.prev_query, self.prev_answer
+
+
+
+
+# memory_manager.py
+
+class MemoryManager:
+    def __init__(self):
+        self.prev_query = None
+        self.prev_answer = None
+        self.prev_embedding = None
+
+    def update(self, query, answer, embedding):
+        self.prev_query = query
+        self.prev_answer = answer
+        self.prev_embedding = embedding
+
+    def get(self):
+        return self.prev_query, self.prev_answer, self.prev_embedding
+
+
+================================================================================
+FILE: base_pipeline\memory_processor.py
+================================================================================
+
+# memory_processor.py
+
+from langchain_community.llms import Ollama
+
+class MemoryProcessor:
+    def __init__(self, model_name="mistral"):
+        self.llm = Ollama(model=model_name)
+
+    def extract_key_points(self, answer):
+        if not answer:
+            return ""
+
+        prompt = f"""
+Extract key points from the following answer as bullet points:
+
+{answer}
+"""
+
+        return self.llm.invoke(prompt)
+
+
+================================================================================
+FILE: base_pipeline\prompt_builder.py
+================================================================================
+
+# # prompt_builder.py
+
+# class PromptBuilder:
+#     def build(self, query, context, relation, key_points=None):
+
+#         if relation == "CONTRAST" and key_points:
+#             return f"""
+# Previous explanation:
+# {key_points}
+
+# Context:
+# {context}
+
+# Question:
+# {query}
+
+# Explain the limitations or drawbacks of the previous approach using the context.
+# """
+
+#         elif relation in ["EXPAND", "DEPENDENT"] and key_points:
+#             return f"""
+# Previous explanation:
+# {key_points}
+
+# Context:
+# {context}
+
+# Question:
+# {query}
+
+# Expand or refine the explanation using both previous knowledge and context.
+# """
+
+#         elif relation == "SAME" and key_points:
+#             return f"""
+# Previous answer:
+# {key_points}
+
+# Context:
+# {context}
+
+# Question:
+# {query}
+
+# Provide a clearer and improved version of the answer.
+# """
+
+#         else:
+#             return f"""
+# Context:
+# {context}
+
+# Question:
+# {query}
+
+# Answer clearly using only the context.
+# """
+
+
+
+
+class PromptBuilder:
+
+    def build_single(self, query, context, previous_summary=None):
+        if previous_summary:
+            return f"""
+You are a research assistant.
+
+You MUST follow these rules:
+- Answer ONLY using the provided context
+- Do NOT add external knowledge
+- If the answer is not present, say "Not found in the document"
+
+Context:
+{context}
+
+Previous context (for reference, may or may not be relevant):
+{previous_summary}
+
+Question:
+{query}
+
+Instructions:
+- If the question asks for explanation → expand using context
+- If it asks for drawbacks → identify limitations from context
+- If it is a follow-up → use previous context only if relevant
+
+Answer clearly and concisely.
+"""
+        else:
+            return f"""
+You are a research assistant.
+
+You MUST follow these rules:
+- Answer ONLY using the provided context
+- Do NOT add external knowledge
+- If the answer is not present, say "Not found in the document"
+
+Context:
+{context}
+
+Question:
+{query}
+
+Answer clearly using only the context.
+"""
+
+    def build_dual(self, query, context_a, context_b, previous_summary=None):
+        return f"""
+You are a research assistant working with TWO separate documents.
+
+You MUST follow these rules:
+- Treat both documents independently
+- Do NOT mix information between documents
+- Use ONLY the given context
+- Do NOT add external knowledge
+- If a document does not contain the answer, say "Not found in that document"
+
+--- DOCUMENT 1 ---
+{context_a}
+
+--- DOCUMENT 2 ---
+{context_b}
+
+Previous context (for reference, may or may not be relevant):
+{previous_summary if previous_summary else "None"}
+
+Question:
+{query}
+
+Instructions:
+1. First, answer using ONLY Document 1 → label as [Doc1 Answer]
+2. Then, answer using ONLY Document 2 → label as [Doc2 Answer]
+3. Then compare both → label as [Comparison]
+
+For comparison:
+- mention similarities
+- mention differences
+- indicate which is more detailed (if applicable)
+
+IMPORTANT:
+- Do NOT use Document 2 content in Doc1 answer
+- Do NOT use Document 1 content in Doc2 answer
+
+Answer format:
+
+[Doc1 Answer]
+...
+
+[Doc2 Answer]
+...
+
+[Comparison]
+...
+"""
+
+
+================================================================================
+FILE: base_pipeline\relation_classifier.py
+================================================================================
+
+# # relation_classifier.py
+
+# from langchain_community.llms import Ollama
+
+# class RelationClassifier:
+#     def __init__(self, model_name="mistral"):
+#         self.llm = Ollama(model=model_name)
+
+#     def classify(self, prev_q, curr_q):
+#         if not prev_q:
+#             return "UNRELATED"
+
+# #         prompt = f"""
+# # Classify the relation between two queries:
+
+# # Q1: {prev_q}
+# # Q2: {curr_q}
+
+# # Return ONLY one word:
+# # SAME, EXPAND, CONTRAST, DEPENDENT, UNRELATED
+# # """
+#         prompt = f"""
+# Classify the relationship BETWEEN queries AND their direction:
+
+# Q1: {prev_q}
+# Q2: {curr_q}
+
+# Consider:
+# - Is Q2 asking for explanation of Q1? → EXPAND
+# - Is Q2 asking for limitations of Q1? → CONTRAST
+# - Is Q2 switching topic? → UNRELATED
+# - Is Q2 reversing perspective? → DEPENDENT
+
+# Return ONLY one:
+# SAME, EXPAND, CONTRAST, DEPENDENT, UNRELATED
+# """
+
+#         result = self.llm.invoke(prompt).strip().upper()
+
+#         valid = {"SAME", "EXPAND", "CONTRAST", "DEPENDENT", "UNRELATED"}
+#         return result if result in valid else "UNRELATED"
+
+
+
+
+
+# relation_classifier.py
+
+import numpy as np
+
+
+class RelationClassifier:
+    def __init__(self, embed_model, high_threshold=0.6, low_threshold=0.4):
+        """
+        embed_model: reuse the embedding model from your pipeline
+        high_threshold: strong relation
+        low_threshold: weak relation
+        """
+        self.embed_model = embed_model
+        self.high_threshold = high_threshold
+        self.low_threshold = low_threshold
+
+    def cosine_sim(self, a, b):
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+    def classify(self, prev_q, curr_q):
+        """
+        Returns:
+        - "HIGH"    → strongly related (use full memory)
+        - "MEDIUM"  → somewhat related (use compressed memory)
+        - "LOW"     → unrelated (ignore memory)
+        """
+
+        if not prev_q:
+            return "LOW", 0.0
+
+        prev_emb = self.embed_model.encode([prev_q])[0]
+        curr_emb = self.embed_model.encode([curr_q])[0]
+
+        sim = self.cosine_sim(prev_emb, curr_emb)
+
+        if sim >= self.high_threshold:
+            return "HIGH", sim
+        elif sim >= self.low_threshold:
+            return "MEDIUM", sim
+        else:
+            return "LOW", sim
+
+
+================================================================================
+FILE: base_pipeline\retrieval_wrapper.py
+================================================================================
+
+# # retrieval_wrapper.py
+
+# from ut import build_pipeline, query_pipeline
+
+# class RetrievalWrapper:
+#     def __init__(self, file_path):
+#         self.chunks, self.faiss, self.bm25, self.embed_model, self.reranker = build_pipeline(file_path)
+
+#     def retrieve(self, query):
+#         return query_pipeline(
+#             query,
+#             self.chunks,
+#             self.faiss,
+#             self.bm25,
+#             self.embed_model,
+#             self.reranker
+#         )
+
+
+
+# retrieval_wrapper.py
+
+from ut import build_pipeline, query_pipeline
+
+class RetrievalWrapper:
+    def __init__(self, file_path):
+        self.chunks, self.faiss, self.bm25, self.embed_model, self.reranker = build_pipeline(file_path)
+
+    def retrieve(self, query):
+        return query_pipeline(
+            query,
+            self.chunks,
+            self.faiss,
+            self.bm25,
+            self.embed_model,
+            self.reranker
+        )
+
+    def embed_query(self, query):
+        return self.embed_model.encode([query])[0]
+
+
+================================================================================
+FILE: base_pipeline\ut.py
+================================================================================
+
+import re
+import numpy as np
+from collections import Counter
+
+import pdfplumber
+import faiss
+import nltk
+from nltk.tokenize import sent_tokenize
+
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from rank_bm25 import BM25Okapi
+
+nltk.download("punkt", quiet=True)
+nltk.download("punkt_tab", quiet=True)
+
+
+# -----------------------------------------------------------------------
+# CONFIG — tweak these for your document
+# -----------------------------------------------------------------------
+CHUNK_SIZE      = 200    # max words per content chunk
+OVERLAP         = 50     # word overlap between chunks
+HYBRID_TOP_K    = 15     # candidates from hybrid retrieval
+RERANK_TOP_K    = 5      # kept after cross-encoder
+CONTEXT_SIZE    = 6      # final assembled context window
+ALPHA           = 0.6    # 0=pure BM25, 1=pure semantic (0.6 favors semantic)
+
+# Heading detection: % of words that must be capitalized for a short line to be a heading
+# Raise this if too many content lines are classified as headings
+HEADING_CAP_RATIO = 0.5
+
+# Minimum font-size DELTA above median to be classified as heading
+# (e.g. 1.5 means the font must be 1.5pt larger than median body text)
+HEADING_SIZE_DELTA = 1.5
+
+
+# -----------------------------------------------------------------------
+# Step 1: Font-aware extraction with pdfplumber
+# -----------------------------------------------------------------------
+def extract_structured_blocks(file_path):
+    blocks = []
+    with pdfplumber.open(file_path) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            words = page.extract_words(extra_attrs=["size", "fontname"])
+            if not words:
+                continue
+
+            # Group words into lines by y-position
+            lines = {}
+            for word in words:
+                y = round(word["top"], 1)
+                lines.setdefault(y, []).append(word)
+
+            for y in sorted(lines.keys()):
+                line_words = lines[y]
+                text = " ".join(w["text"] for w in line_words).strip()
+                avg_size = sum(w["size"] for w in line_words) / len(line_words)
+                font = line_words[0]["fontname"]
+
+                if text:
+                    blocks.append({
+                        "text": text,
+                        "size": round(avg_size, 2),
+                        "font": font,
+                        "page": page_num + 1,
+                    })
+    return blocks
+
+
+def get_body_font_size(blocks):
+    """
+    Body text is the MOST COMMON font size in the document.
+    Much more reliable than percentile-based thresholding.
+    """
+    size_counter = Counter(round(b["size"], 1) for b in blocks)
+    body_size = size_counter.most_common(1)[0][0]
+    print(f"   Detected body font size: {body_size}pt")
+    return body_size
+
+
+# -----------------------------------------------------------------------
+# Step 2: Reliable heading classification
+# Uses BOTH font size delta AND capitalization ratio
+# -----------------------------------------------------------------------
+def classify_block(block, body_size):
+    text = block["text"].strip()
+    words = text.split()
+
+    if not words:
+        return "content"
+
+    # Bullet detection
+    if text[0] in ("•", "-", "–", "▪", "*"):
+        return "bullet"
+
+    size_delta = block["size"] - body_size
+    word_count = len(words)
+
+    # Strong heading signal: significantly larger font
+    if size_delta >= HEADING_SIZE_DELTA:
+        return "heading"
+
+    # Weak heading signal: same size but short + mostly capitalized
+    # (e.g. bold section titles rendered at same size)
+    if word_count <= 10 and not text.endswith("."):
+        cap_ratio = sum(1 for w in words if w[0].isupper()) / word_count
+        if cap_ratio >= HEADING_CAP_RATIO and size_delta >= 0:
+            return "heading"
+
+    return "content"
+
+
+# -----------------------------------------------------------------------
+# Step 3: Noise filtering
+# -----------------------------------------------------------------------
+def is_noise(text):
+    t = text.lower().strip()
+    if re.match(r"^page \d+", t):          return True
+    if "pg." in t and len(t.split()) <= 4: return True
+    if len(t.split()) <= 2:                return True
+    if re.match(r"^[\d\s\.\,\-]+$", t):   return True
+    return False
+
+
+# -----------------------------------------------------------------------
+# Step 4: Sentence-aware chunking
+# -----------------------------------------------------------------------
+def sentence_aware_chunk(text, chunk_size=CHUNK_SIZE, overlap=OVERLAP):
+    sentences = sent_tokenize(text)
+    chunks = []
+    current_words = []
+
+    for sentence in sentences:
+        words = sentence.split()
+        if len(current_words) + len(words) > chunk_size and current_words:
+            chunks.append(" ".join(current_words))
+            current_words = (current_words[-overlap:] if len(current_words) > overlap else current_words[:]) + words
+        else:
+            current_words.extend(words)
+
+    if current_words:
+        chunks.append(" ".join(current_words))
+
+    return chunks
+
+
+# -----------------------------------------------------------------------
+# Step 5: Build structured chunks
+# -----------------------------------------------------------------------
+def build_structured_chunks(file_path):
+    print("\n📄 Extracting structured blocks from PDF...")
+    blocks = extract_structured_blocks(file_path)
+    print(f"   Raw line-blocks extracted: {len(blocks)}")
+
+    body_size = get_body_font_size(blocks)
+
+    # Deduplicate repeated lines (headers/footers)
+    normalized_texts = [re.sub(r"\s+", " ", b["text"].lower()) for b in blocks]
+    counts = Counter(normalized_texts)
+
+    # ---- Merge consecutive same-type lines into paragraphs ----
+    merged = []
+    current_para = None
+
+    for block, norm in zip(blocks, normalized_texts):
+        if counts[norm] > 2 or is_noise(block["text"]):
+            continue
+
+        btype = classify_block(block, body_size)
+
+        if current_para is None:
+            current_para = {"text": block["text"], "size": block["size"],
+                            "font": block["font"], "page": block["page"], "type": btype}
+        elif btype == current_para["type"] and btype != "heading":
+            # Merge consecutive content/bullet lines into one paragraph
+            current_para["text"] += " " + block["text"]
+        else:
+            merged.append(current_para)
+            current_para = {"text": block["text"], "size": block["size"],
+                            "font": block["font"], "page": block["page"], "type": btype}
+
+    if current_para:
+        merged.append(current_para)
+
+    print(f"   Merged paragraph blocks: {len(merged)}")
+
+    # ---- Chunk merged paragraphs ----
+    raw_chunks = []
+    current_heading = None
+    heading_count = sum(1 for m in merged if m["type"] == "heading")
+    content_count  = sum(1 for m in merged if m["type"] != "heading")
+    print(f"   Headings: {heading_count} | Content/Bullet blocks: {content_count}")
+
+    for block in merged:
+        if block["type"] == "heading":
+            current_heading = block["text"].strip()
+            raw_chunks.append({
+                "text": current_heading,
+                "type": "heading",
+                "page": block["page"],
+                "heading": current_heading,
+            })
+        else:
+            sub_chunks = sentence_aware_chunk(block["text"])
+            for sub in sub_chunks:
+                raw_chunks.append({
+                    "text": sub,
+                    "type": block["type"],
+                    "page": block["page"],
+                    "heading": current_heading,
+                })
+
+    heading_final  = sum(1 for c in raw_chunks if c["type"] == "heading")
+    content_final  = sum(1 for c in raw_chunks if c["type"] != "heading")
+    print(f"   Final chunks → headings: {heading_final} | content+bullet: {content_final}")
+
+    if heading_final > content_final:
+        print("\n⚠️  WARNING: More headings than content chunks detected!")
+        print("   → Increase HEADING_SIZE_DELTA or HEADING_CAP_RATIO in CONFIG.")
+        print("   → Run diagnose_fonts.py to inspect your document's font sizes.\n")
+
+    return raw_chunks
+
+
+# -----------------------------------------------------------------------
+# Step 6: Embed chunks
+# -----------------------------------------------------------------------
+def embed_chunks(raw_chunks, model):
+    texts = [c["text"] for c in raw_chunks]
+    embeddings = model.encode(texts, show_progress_bar=True, batch_size=64)
+
+    chunks = []
+    for i, (chunk, emb) in enumerate(zip(raw_chunks, embeddings)):
+        chunks.append({
+            "id":      i,
+            "text":    chunk["text"],
+            "type":    chunk["type"],
+            "page":    chunk["page"],
+            "heading": chunk.get("heading"),
+            "embedding": emb.astype("float32"),
+            "length":  len(chunk["text"].split()),
+            "links":   [],
+        })
+    return chunks
+
+
+# -----------------------------------------------------------------------
+# Step 7: FAISS index
+# -----------------------------------------------------------------------
+def build_faiss_index(chunks):
+    embeddings = np.array([c["embedding"] for c in chunks]).astype("float32")
+    faiss.normalize_L2(embeddings)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+    print(f"   FAISS index: {index.ntotal} vectors (dim={embeddings.shape[1]})")
+    return index
+
+
+# -----------------------------------------------------------------------
+# Step 8: BM25 index
+# -----------------------------------------------------------------------
+def build_bm25_index(chunks):
+    tokenized = [c["text"].lower().split() for c in chunks]
+    print(f"   BM25 index: {len(tokenized)} chunks")
+    return BM25Okapi(tokenized)
+
+
+# -----------------------------------------------------------------------
+# Step 9: Heading-span linking
+# -----------------------------------------------------------------------
+def link_heading_spans(chunks):
+    current_heading_idx = None
+    linked = 0
+    for i, chunk in enumerate(chunks):
+        if chunk["type"] == "heading":
+            current_heading_idx = i
+        elif current_heading_idx is not None:
+            chunks[current_heading_idx]["links"].append({"id": i, "score": 1.0})
+            chunks[i]["links"].append({"id": current_heading_idx, "score": 1.0})
+            linked += 1
+    print(f"   Heading-span links created: {linked}")
+
+
+# -----------------------------------------------------------------------
+# Step 10: Hybrid retrieval (semantic + BM25)
+# Headings are EXCLUDED from retrieval — they exist only for context assembly
+# -----------------------------------------------------------------------
+def hybrid_retrieve(query, chunks, bm25, faiss_index, model,
+                    top_k=HYBRID_TOP_K, alpha=ALPHA):
+    n = len(chunks)
+
+    # BM25
+    bm25_scores = bm25.get_scores(query.lower().split())
+    bm25_norm   = bm25_scores / (bm25_scores.max() + 1e-9)
+
+    # Semantic
+    query_emb = model.encode([query]).astype("float32")
+    faiss.normalize_L2(query_emb)
+    raw_scores, indices = faiss_index.search(query_emb, n)
+
+    sem_norm = np.zeros(n)
+    for rank in range(len(indices[0])):
+        idx = indices[0][rank]
+        if 0 <= idx < n:
+            sem_norm[idx] = raw_scores[0][rank]
+
+    combined = alpha * sem_norm + (1 - alpha) * bm25_norm
+
+    # ---- KEY FIX: penalize headings so content chunks surface ----
+    for i, chunk in enumerate(chunks):
+        if chunk["type"] == "heading":
+            combined[i] *= 0.3   # 70% score penalty on headings
+
+    top_indices = np.argsort(combined)[::-1][:top_k]
+
+    print(f"\n🔀 Hybrid top-{top_k} (α={alpha}, headings penalized):")
+    for idx in top_indices:
+        c = chunks[idx]
+        print(f"   ID {c['id']:3d} | {c['type']:8s} | "
+              f"sem={sem_norm[idx]:.3f} bm25={bm25_norm[idx]:.3f} "
+              f"fused={combined[idx]:.3f} | pg {c['page']}")
+
+    return [chunks[i] for i in top_indices]
+
+
+# -----------------------------------------------------------------------
+# Step 11: Cross-encoder re-ranking
+# -----------------------------------------------------------------------
+def rerank_candidates(query, candidates, reranker):
+    pairs  = [(query, c["text"]) for c in candidates]
+    scores = reranker.predict(pairs)
+    ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+
+    print(f"\n🏆 Re-ranked:")
+    for score, c in ranked:
+        print(f"   ID {c['id']:3d} | {c['type']:8s} | "
+              f"rerank={score:6.3f} | pg {c['page']}"
+              + (f" | under: '{c['heading'][:40]}'" if c.get("heading") and c["type"] != "heading" else ""))
+
+    return [c for _, c in ranked]
+
+
+# -------------------------------
+# Section-level grouping
+# -------------------------------
+def group_by_heading(chunks):
+    sections = {}
+
+    for c in chunks:
+        heading = c.get("heading") or "NO_HEADING"
+
+        if heading not in sections:
+            sections[heading] = []
+
+        sections[heading].append(c)
+
+    return sections
+
+
+# -------------------------------
+# Section scoring (using reranker)
+# -------------------------------
+def score_section(section_chunks, query, reranker):
+    pairs = [(query, c["text"]) for c in section_chunks]
+    scores = reranker.predict(pairs)
+
+    return sum(scores) / len(scores)
+
+
+# -------------------------------
+# Select best section
+# -------------------------------
+def select_best_section(reranked_chunks, query, reranker):
+    sections = group_by_heading(reranked_chunks)
+
+    best_section = None
+    best_score = float("-inf")
+
+    print("\n📊 Section Scores:\n")
+
+    for heading, chunks in sections.items():
+        score = score_section(chunks, query, reranker)
+
+        print(f"→ {heading[:50]} | score={score:.3f}")
+
+        if score > best_score:
+            best_score = score
+            best_section = (heading, chunks)
+
+    return best_section
+
+
+# -----------------------------------------------------------------------
+# Step 12: Context assembly
+# Pull in parent heading + sibling content around each top chunk
+# -----------------------------------------------------------------------
+def assemble_context(top_chunks, chunks, max_chunks=CONTEXT_SIZE):
+    seen_ids = set()
+    context  = []
+
+    for chunk in top_chunks:
+        if len(context) >= max_chunks:
+            break
+
+        # Add heading first (for labeling)
+        for link in chunk["links"]:
+            linked = chunks[link["id"]]
+            if linked["type"] == "heading" and linked["id"] not in seen_ids:
+                context.append(linked)
+                seen_ids.add(linked["id"])
+
+        # Add the content chunk itself
+        if chunk["id"] not in seen_ids:
+            context.append(chunk)
+            seen_ids.add(chunk["id"])
+
+        # Add adjacent content siblings (same heading)
+        for link in chunk["links"]:
+            if len(context) >= max_chunks:
+                break
+            linked = chunks[link["id"]]
+            if linked["type"] in ("content", "bullet") and linked["id"] not in seen_ids:
+                context.append(linked)
+                seen_ids.add(linked["id"])
+
+    # Sort final context by document order (chunk ID = document order)
+    context.sort(key=lambda c: c["id"])
+    return context
+
+
+# -----------------------------------------------------------------------
+# Pipeline builders
+# -----------------------------------------------------------------------
+def build_pipeline(file_path):
+    raw_chunks = build_structured_chunks(file_path)
+
+    print("\n🧠 Loading embedding model...")
+    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+    print("\n🧠 Loading cross-encoder re-ranker...")
+    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+    print("\n🔢 Embedding chunks...")
+    chunks = embed_chunks(raw_chunks, embed_model)
+
+    print("\n🔗 Linking heading spans...")
+    link_heading_spans(chunks)
+
+    print_tree(chunks, limit=100)
+
+    print("\n📦 Building FAISS index...")
+    faiss_index = build_faiss_index(chunks)
+
+    print("\n📦 Building BM25 index...")
+    bm25_index = build_bm25_index(chunks)
+
+    return chunks, faiss_index, bm25_index, embed_model, reranker
+
+
+def query_pipeline(query, chunks, faiss_index, bm25_index, embed_model, reranker):
+    print(f"\n💬 Query: {query}")
+
+    candidates = hybrid_retrieve(query, chunks, bm25_index, faiss_index, embed_model)
+    reranked   = rerank_candidates(query, candidates, reranker)
+    # top_chunks = reranked[:RERANK_TOP_K]
+    # context    = assemble_context(top_chunks, chunks)
+    # return context
+    heading, best_chunks = select_best_section(reranked, query, reranker)
+
+    print(f"\n🏆 Selected Section: {heading}\n")
+
+    context = assemble_context(best_chunks, chunks)
+
+    return context
+
+
+
+
+def print_tree(chunks, limit=None):
+    print("\n🌳 DOCUMENT TREE STRUCTURE:\n")
+
+    tree = {}
+    
+    # Group chunks by heading
+    for c in chunks:
+        heading = c.get("heading") or "ROOT"
+
+        if heading not in tree:
+            tree[heading] = []
+
+        tree[heading].append(c)
+
+    count = 0
+
+    for heading, items in tree.items():
+        print(f"\n📂 {heading}\n")
+
+        for c in items:
+            if c["type"] == "heading":
+                continue
+
+            prefix = "   ├──"
+            if c["type"] == "bullet":
+                prefix = "   •"
+
+            print(f"{prefix} [ID {c['id']}] ({c['type']}) {c['text'][:100]}")
+
+            count += 1
+            if limit and count >= limit:
+                return
+
+# -----------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------
+if __name__ == "__main__":
+    file_path = r"C:\Users\karth\Downloads\j0_endgame_merged.pdf"
+
+    chunks, faiss_index, bm25_index, embed_model, reranker = build_pipeline(file_path)
+
+    print("\n" + "=" * 60)
+    print("RAG Pipeline Ready. Type 'exit' to quit.")
+    print("=" * 60)
+
+    while True:
+        query = input("\n💬 Enter query: ").strip()
+        if query.lower() in ("exit", "quit", "q"):
+            print("👋 Exiting.")
+            break
+        if not query:
+            continue
+
+        context = query_pipeline(query, chunks, faiss_index, bm25_index, embed_model, reranker)
+
+        print("\n📦 RETRIEVED CONTEXT:\n" + "=" * 60)
+        for c in context:
+            label = f"[ID {c['id']}] [{c['type'].upper()}] [Page {c['page']}]"
+            if c.get("heading") and c["type"] != "heading":
+                label += f" ← '{c['heading'][:50]}'"
+            print(label)
+            print(c["text"][:500])
+            print("-" * 60)
+
+        print("\n✅ Done.")
+
+
+================================================================================
+FILE: base_pipeline\utils.py
+================================================================================
+
+# utils.py
+
+def format_context(chunks):
+    lines = []
+
+    for c in chunks:
+        if c["type"] == "heading":
+            lines.append(f"\n### {c['text']}\n")
+        else:
+            lines.append(c["text"])
+
+    return "\n".join(lines)
+
+
+================================================================================
+FILE: frontend\index.html
+================================================================================
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DocuMind</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+
+
+================================================================================
+FILE: frontend\package-lock.json
+================================================================================
+
+{
+  "name": "frontend",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "frontend",
+      "version": "0.0.0",
+      "dependencies": {
+        "react": "^19.2.5",
+        "react-dom": "^19.2.5",
+        "uuid": "^9.0.1",
+        "zustand": "^5.0.12"
+      },
+      "devDependencies": {
+        "@vitejs/plugin-react": "^6.0.1",
+        "vite": "^8.0.4"
+      }
+    },
+    "node_modules/@emnapi/core": {
+      "version": "1.9.2",
+      "resolved": "https://registry.npmjs.org/@emnapi/core/-/core-1.9.2.tgz",
+      "integrity": "sha512-UC+ZhH3XtczQYfOlu3lNEkdW/p4dsJ1r/bP7H8+rhao3TTTMO1ATq/4DdIi23XuGoFY+Cz0JmCbdVl0hz9jZcA==",
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "@emnapi/wasi-threads": "1.2.1",
+        "tslib": "^2.4.0"
+      }
+    },
+    "node_modules/@emnapi/runtime": {
+      "version": "1.9.2",
+      "resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.9.2.tgz",
+      "integrity": "sha512-3U4+MIWHImeyu1wnmVygh5WlgfYDtyf0k8AbLhMFxOipihf6nrWC4syIm/SwEeec0mNSafiiNnMJwbza/Is6Lw==",
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "tslib": "^2.4.0"
+      }
+    },
+    "node_modules/@emnapi/wasi-threads": {
+      "version": "1.2.1",
+      "resolved": "https://registry.npmjs.org/@emnapi/wasi-threads/-/wasi-threads-1.2.1.tgz",
+      "integrity": "sha512-uTII7OYF+/Mes/MrcIOYp5yOtSMLBWSIoLPpcgwipoiKbli6k322tcoFsxoIIxPDqW01SQGAgko4EzZi2BNv2w==",
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "tslib": "^2.4.0"
+      }
+    },
+    "node_modules/@napi-rs/wasm-runtime": {
+      "version": "1.1.4",
+      "resolved": "https://registry.npmjs.org/@napi-rs/wasm-runtime/-/wasm-runtime-1.1.4.tgz",
+      "integrity": "sha512-3NQNNgA1YSlJb/kMH1ildASP9HW7/7kYnRI2szWJaofaS1hWmbGI4H+d3+22aGzXXN9IJ+n+GiFVcGipJP18ow==",
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "@tybys/wasm-util": "^0.10.1"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      },
+      "peerDependencies": {
+        "@emnapi/core": "^1.7.1",
+        "@emnapi/runtime": "^1.7.1"
+      }
+    },
+    "node_modules/@oxc-project/types": {
+      "version": "0.124.0",
+      "resolved": "https://registry.npmjs.org/@oxc-project/types/-/types-0.124.0.tgz",
+      "integrity": "sha512-VBFWMTBvHxS11Z5Lvlr3IWgrwhMTXV+Md+EQF0Xf60+wAdsGFTBx7X7K/hP4pi8N7dcm1RvcHwDxZ16Qx8keUg==",
+      "dev": true,
+      "license": "MIT",
+      "funding": {
+        "url": "https://github.com/sponsors/Boshen"
+      }
+    },
+    "node_modules/@rolldown/binding-android-arm64": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-android-arm64/-/binding-android-arm64-1.0.0-rc.15.tgz",
+      "integrity": "sha512-YYe6aWruPZDtHNpwu7+qAHEMbQ/yRl6atqb/AhznLTnD3UY99Q1jE7ihLSahNWkF4EqRPVC4SiR4O0UkLK02tA==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "android"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-darwin-arm64": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-darwin-arm64/-/binding-darwin-arm64-1.0.0-rc.15.tgz",
+      "integrity": "sha512-oArR/ig8wNTPYsXL+Mzhs0oxhxfuHRfG7Ikw7jXsw8mYOtk71W0OkF2VEVh699pdmzjPQsTjlD1JIOoHkLP1Fg==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-darwin-x64": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-darwin-x64/-/binding-darwin-x64-1.0.0-rc.15.tgz",
+      "integrity": "sha512-YzeVqOqjPYvUbJSWJ4EDL8ahbmsIXQpgL3JVipmN+MX0XnXMeWomLN3Fb+nwCmP/jfyqte5I3XRSm7OfQrbyxw==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-freebsd-x64": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-freebsd-x64/-/binding-freebsd-x64-1.0.0-rc.15.tgz",
+      "integrity": "sha512-9Erhx956jeQ0nNTyif1+QWAXDRD38ZNjr//bSHrt6wDwB+QkAfl2q6Mn1k6OBPerznjRmbM10lgRb1Pli4xZPw==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "freebsd"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-arm-gnueabihf": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm-gnueabihf/-/binding-linux-arm-gnueabihf-1.0.0-rc.15.tgz",
+      "integrity": "sha512-cVwk0w8QbZJGTnP/AHQBs5yNwmpgGYStL88t4UIaqcvYJWBfS0s3oqVLZPwsPU6M0zlW4GqjP0Zq5MnAGwFeGA==",
+      "cpu": [
+        "arm"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-arm64-gnu": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm64-gnu/-/binding-linux-arm64-gnu-1.0.0-rc.15.tgz",
+      "integrity": "sha512-eBZ/u8iAK9SoHGanqe/jrPnY0JvBN6iXbVOsbO38mbz+ZJsaobExAm1Iu+rxa4S1l2FjG0qEZn4Rc6X8n+9M+w==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-arm64-musl": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm64-musl/-/binding-linux-arm64-musl-1.0.0-rc.15.tgz",
+      "integrity": "sha512-ZvRYMGrAklV9PEkgt4LQM6MjQX2P58HPAuecwYObY2DhS2t35R0I810bKi0wmaYORt6m/2Sm+Z+nFgb0WhXNcQ==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-ppc64-gnu": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-ppc64-gnu/-/binding-linux-ppc64-gnu-1.0.0-rc.15.tgz",
+      "integrity": "sha512-VDpgGBzgfg5hLg+uBpCLoFG5kVvEyafmfxGUV0UHLcL5irxAK7PKNeC2MwClgk6ZAiNhmo9FLhRYgvMmedLtnQ==",
+      "cpu": [
+        "ppc64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-s390x-gnu": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-s390x-gnu/-/binding-linux-s390x-gnu-1.0.0-rc.15.tgz",
+      "integrity": "sha512-y1uXY3qQWCzcPgRJATPSOUP4tCemh4uBdY7e3EZbVwCJTY3gLJWnQABgeUetvED+bt1FQ01OeZwvhLS2bpNrAQ==",
+      "cpu": [
+        "s390x"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-x64-gnu": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-x64-gnu/-/binding-linux-x64-gnu-1.0.0-rc.15.tgz",
+      "integrity": "sha512-023bTPBod7J3Y/4fzAN6QtpkSABR0rigtrwaP+qSEabUh5zf6ELr9Nc7GujaROuPY3uwdSIXWrvhn1KxOvurWA==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-x64-musl": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-x64-musl/-/binding-linux-x64-musl-1.0.0-rc.15.tgz",
+      "integrity": "sha512-witB2O0/hU4CgfOOKUoeFgQ4GktPi1eEbAhaLAIpgD6+ZnhcPkUtPsoKKHRzmOoWPZue46IThdSgdo4XneOLYw==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-openharmony-arm64": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-openharmony-arm64/-/binding-openharmony-arm64-1.0.0-rc.15.tgz",
+      "integrity": "sha512-UCL68NJ0Ud5zRipXZE9dF5PmirzJE4E4BCIOOssEnM7wLDsxjc6Qb0sGDxTNRTP53I6MZpygyCpY8Aa8sPfKPg==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "openharmony"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-wasm32-wasi": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-wasm32-wasi/-/binding-wasm32-wasi-1.0.0-rc.15.tgz",
+      "integrity": "sha512-ApLruZq/ig+nhaE7OJm4lDjayUnOHVUa77zGeqnqZ9pn0ovdVbbNPerVibLXDmWeUZXjIYIT8V3xkT58Rm9u5Q==",
+      "cpu": [
+        "wasm32"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "@emnapi/core": "1.9.2",
+        "@emnapi/runtime": "1.9.2",
+        "@napi-rs/wasm-runtime": "^1.1.3"
+      },
+      "engines": {
+        "node": ">=14.0.0"
+      }
+    },
+    "node_modules/@rolldown/binding-win32-arm64-msvc": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-win32-arm64-msvc/-/binding-win32-arm64-msvc-1.0.0-rc.15.tgz",
+      "integrity": "sha512-KmoUoU7HnN+Si5YWJigfTws1jz1bKBYDQKdbLspz0UaqjjFkddHsqorgiW1mxcAj88lYUE6NC/zJNwT+SloqtA==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-win32-x64-msvc": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-win32-x64-msvc/-/binding-win32-x64-msvc-1.0.0-rc.15.tgz",
+      "integrity": "sha512-3P2A8L+x75qavWLe/Dll3EYBJLQmtkJN8rfh+U/eR3MqMgL/h98PhYI+JFfXuDPgPeCB7iZAKiqii5vqOvnA0g==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/pluginutils": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/@rolldown/pluginutils/-/pluginutils-1.0.0-rc.15.tgz",
+      "integrity": "sha512-UromN0peaE53IaBRe9W7CjrZgXl90fqGpK+mIZbA3qSTeYqg3pqpROBdIPvOG3F5ereDHNwoHBI2e50n1BDr1g==",
+      "dev": true,
+      "license": "MIT"
+    },
+    "node_modules/@tybys/wasm-util": {
+      "version": "0.10.1",
+      "resolved": "https://registry.npmjs.org/@tybys/wasm-util/-/wasm-util-0.10.1.tgz",
+      "integrity": "sha512-9tTaPJLSiejZKx+Bmog4uSubteqTvFrVrURwkmHixBo0G4seD0zUxp98E1DzUBJxLQ3NPwXrGKDiVjwx/DpPsg==",
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "tslib": "^2.4.0"
+      }
+    },
+    "node_modules/@vitejs/plugin-react": {
+      "version": "6.0.1",
+      "resolved": "https://registry.npmjs.org/@vitejs/plugin-react/-/plugin-react-6.0.1.tgz",
+      "integrity": "sha512-l9X/E3cDb+xY3SWzlG1MOGt2usfEHGMNIaegaUGFsLkb3RCn/k8/TOXBcab+OndDI4TBtktT8/9BwwW8Vi9KUQ==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "@rolldown/pluginutils": "1.0.0-rc.7"
+      },
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      },
+      "peerDependencies": {
+        "@rolldown/plugin-babel": "^0.1.7 || ^0.2.0",
+        "babel-plugin-react-compiler": "^1.0.0",
+        "vite": "^8.0.0"
+      },
+      "peerDependenciesMeta": {
+        "@rolldown/plugin-babel": {
+          "optional": true
+        },
+        "babel-plugin-react-compiler": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/@vitejs/plugin-react/node_modules/@rolldown/pluginutils": {
+      "version": "1.0.0-rc.7",
+      "resolved": "https://registry.npmjs.org/@rolldown/pluginutils/-/pluginutils-1.0.0-rc.7.tgz",
+      "integrity": "sha512-qujRfC8sFVInYSPPMLQByRh7zhwkGFS4+tyMQ83srV1qrxL4g8E2tyxVVyxd0+8QeBM1mIk9KbWxkegRr76XzA==",
+      "dev": true,
+      "license": "MIT"
+    },
+    "node_modules/detect-libc": {
+      "version": "2.1.2",
+      "resolved": "https://registry.npmjs.org/detect-libc/-/detect-libc-2.1.2.tgz",
+      "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==",
+      "dev": true,
+      "license": "Apache-2.0",
+      "engines": {
+        "node": ">=8"
+      }
+    },
+    "node_modules/fdir": {
+      "version": "6.5.0",
+      "resolved": "https://registry.npmjs.org/fdir/-/fdir-6.5.0.tgz",
+      "integrity": "sha512-tIbYtZbucOs0BRGqPJkshJUYdL+SDH7dVM8gjy+ERp3WAUjLEFJE+02kanyHtwjWOnwrKYBiwAmM0p4kLJAnXg==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">=12.0.0"
+      },
+      "peerDependencies": {
+        "picomatch": "^3 || ^4"
+      },
+      "peerDependenciesMeta": {
+        "picomatch": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/fsevents": {
+      "version": "2.3.3",
+      "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
+      "integrity": "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==",
+      "dev": true,
+      "hasInstallScript": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
+      }
+    },
+    "node_modules/lightningcss": {
+      "version": "1.32.0",
+      "resolved": "https://registry.npmjs.org/lightningcss/-/lightningcss-1.32.0.tgz",
+      "integrity": "sha512-NXYBzinNrblfraPGyrbPoD19C1h9lfI/1mzgWYvXUTe414Gz/X1FD2XBZSZM7rRTrMA8JL3OtAaGifrIKhQ5yQ==",
+      "dev": true,
+      "license": "MPL-2.0",
+      "dependencies": {
+        "detect-libc": "^2.0.3"
+      },
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      },
+      "optionalDependencies": {
+        "lightningcss-android-arm64": "1.32.0",
+        "lightningcss-darwin-arm64": "1.32.0",
+        "lightningcss-darwin-x64": "1.32.0",
+        "lightningcss-freebsd-x64": "1.32.0",
+        "lightningcss-linux-arm-gnueabihf": "1.32.0",
+        "lightningcss-linux-arm64-gnu": "1.32.0",
+        "lightningcss-linux-arm64-musl": "1.32.0",
+        "lightningcss-linux-x64-gnu": "1.32.0",
+        "lightningcss-linux-x64-musl": "1.32.0",
+        "lightningcss-win32-arm64-msvc": "1.32.0",
+        "lightningcss-win32-x64-msvc": "1.32.0"
+      }
+    },
+    "node_modules/lightningcss-android-arm64": {
+      "version": "1.32.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-android-arm64/-/lightningcss-android-arm64-1.32.0.tgz",
+      "integrity": "sha512-YK7/ClTt4kAK0vo6w3X+Pnm0D2cf2vPHbhOXdoNti1Ga0al1P4TBZhwjATvjNwLEBCnKvjJc2jQgHXH0NEwlAg==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "android"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-darwin-arm64": {
+      "version": "1.32.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-darwin-arm64/-/lightningcss-darwin-arm64-1.32.0.tgz",
+      "integrity": "sha512-RzeG9Ju5bag2Bv1/lwlVJvBE3q6TtXskdZLLCyfg5pt+HLz9BqlICO7LZM7VHNTTn/5PRhHFBSjk5lc4cmscPQ==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-darwin-x64": {
+      "version": "1.32.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-darwin-x64/-/lightningcss-darwin-x64-1.32.0.tgz",
+      "integrity": "sha512-U+QsBp2m/s2wqpUYT/6wnlagdZbtZdndSmut/NJqlCcMLTWp5muCrID+K5UJ6jqD2BFshejCYXniPDbNh73V8w==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-freebsd-x64": {
+      "version": "1.32.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-freebsd-x64/-/lightningcss-freebsd-x64-1.32.0.tgz",
+      "integrity": "sha512-JCTigedEksZk3tHTTthnMdVfGf61Fky8Ji2E4YjUTEQX14xiy/lTzXnu1vwiZe3bYe0q+SpsSH/CTeDXK6WHig==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "freebsd"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-linux-arm-gnueabihf": {
+      "version": "1.32.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm-gnueabihf/-/lightningcss-linux-arm-gnueabihf-1.32.0.tgz",
+      "integrity": "sha512-x6rnnpRa2GL0zQOkt6rts3YDPzduLpWvwAF6EMhXFVZXD4tPrBkEFqzGowzCsIWsPjqSK+tyNEODUBXeeVHSkw==",
+      "cpu": [
+        "arm"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-linux-arm64-gnu": {
+      "version": "1.32.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm64-gnu/-/lightningcss-linux-arm64-gnu-1.32.0.tgz",
+      "integrity": "sha512-0nnMyoyOLRJXfbMOilaSRcLH3Jw5z9HDNGfT/gwCPgaDjnx0i8w7vBzFLFR1f6CMLKF8gVbebmkUN3fa/kQJpQ==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-linux-arm64-musl": {
+      "version": "1.32.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm64-musl/-/lightningcss-linux-arm64-musl-1.32.0.tgz",
+      "integrity": "sha512-UpQkoenr4UJEzgVIYpI80lDFvRmPVg6oqboNHfoH4CQIfNA+HOrZ7Mo7KZP02dC6LjghPQJeBsvXhJod/wnIBg==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-linux-x64-gnu": {
+      "version": "1.32.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-linux-x64-gnu/-/lightningcss-linux-x64-gnu-1.32.0.tgz",
+      "integrity": "sha512-V7Qr52IhZmdKPVr+Vtw8o+WLsQJYCTd8loIfpDaMRWGUZfBOYEJeyJIkqGIDMZPwPx24pUMfwSxxI8phr/MbOA==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-linux-x64-musl": {
+      "version": "1.32.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-linux-x64-musl/-/lightningcss-linux-x64-musl-1.32.0.tgz",
+      "integrity": "sha512-bYcLp+Vb0awsiXg/80uCRezCYHNg1/l3mt0gzHnWV9XP1W5sKa5/TCdGWaR/zBM2PeF/HbsQv/j2URNOiVuxWg==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-win32-arm64-msvc": {
+      "version": "1.32.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-win32-arm64-msvc/-/lightningcss-win32-arm64-msvc-1.32.0.tgz",
+      "integrity": "sha512-8SbC8BR40pS6baCM8sbtYDSwEVQd4JlFTOlaD3gWGHfThTcABnNDBda6eTZeqbofalIJhFx0qKzgHJmcPTnGdw==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-win32-x64-msvc": {
+      "version": "1.32.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-win32-x64-msvc/-/lightningcss-win32-x64-msvc-1.32.0.tgz",
+      "integrity": "sha512-Amq9B/SoZYdDi1kFrojnoqPLxYhQ4Wo5XiL8EVJrVsB8ARoC1PWW6VGtT0WKCemjy8aC+louJnjS7U18x3b06Q==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/nanoid": {
+      "version": "3.3.11",
+      "resolved": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.11.tgz",
+      "integrity": "sha512-N8SpfPUnUp1bK+PMYW8qSWdl9U+wwNWI4QKxOYDy9JAro3WMX7p2OeVRF9v+347pnakNevPmiHhNmZ2HbFA76w==",
+      "dev": true,
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/ai"
+        }
+      ],
+      "license": "MIT",
+      "bin": {
+        "nanoid": "bin/nanoid.cjs"
+      },
+      "engines": {
+        "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
+      }
+    },
+    "node_modules/picocolors": {
+      "version": "1.1.1",
+      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
+      "integrity": "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==",
+      "dev": true,
+      "license": "ISC"
+    },
+    "node_modules/picomatch": {
+      "version": "4.0.4",
+      "resolved": "https://registry.npmjs.org/picomatch/-/picomatch-4.0.4.tgz",
+      "integrity": "sha512-QP88BAKvMam/3NxH6vj2o21R6MjxZUAd6nlwAS/pnGvN9IVLocLHxGYIzFhg6fUQ+5th6P4dv4eW9jX3DSIj7A==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">=12"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/jonschlinkert"
+      }
+    },
+    "node_modules/postcss": {
+      "version": "8.5.10",
+      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.10.tgz",
+      "integrity": "sha512-pMMHxBOZKFU6HgAZ4eyGnwXF/EvPGGqUr0MnZ5+99485wwW41kW91A4LOGxSHhgugZmSChL5AlElNdwlNgcnLQ==",
+      "dev": true,
+      "funding": [
+        {
+          "type": "opencollective",
+          "url": "https://opencollective.com/postcss/"
+        },
+        {
+          "type": "tidelift",
+          "url": "https://tidelift.com/funding/github/npm/postcss"
+        },
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/ai"
+        }
+      ],
+      "license": "MIT",
+      "dependencies": {
+        "nanoid": "^3.3.11",
+        "picocolors": "^1.1.1",
+        "source-map-js": "^1.2.1"
+      },
+      "engines": {
+        "node": "^10 || ^12 || >=14"
+      }
+    },
+    "node_modules/react": {
+      "version": "19.2.5",
+      "resolved": "https://registry.npmjs.org/react/-/react-19.2.5.tgz",
+      "integrity": "sha512-llUJLzz1zTUBrskt2pwZgLq59AemifIftw4aB7JxOqf1HY2FDaGDxgwpAPVzHU1kdWabH7FauP4i1oEeer2WCA==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=0.10.0"
+      }
+    },
+    "node_modules/react-dom": {
+      "version": "19.2.5",
+      "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-19.2.5.tgz",
+      "integrity": "sha512-J5bAZz+DXMMwW/wV3xzKke59Af6CHY7G4uYLN1OvBcKEsWOs4pQExj86BBKamxl/Ik5bx9whOrvBlSDfWzgSag==",
+      "license": "MIT",
+      "dependencies": {
+        "scheduler": "^0.27.0"
+      },
+      "peerDependencies": {
+        "react": "^19.2.5"
+      }
+    },
+    "node_modules/rolldown": {
+      "version": "1.0.0-rc.15",
+      "resolved": "https://registry.npmjs.org/rolldown/-/rolldown-1.0.0-rc.15.tgz",
+      "integrity": "sha512-Ff31guA5zT6WjnGp0SXw76X6hzGRk/OQq2hE+1lcDe+lJdHSgnSX6nK3erbONHyCbpSj9a9E+uX/OvytZoWp2g==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "@oxc-project/types": "=0.124.0",
+        "@rolldown/pluginutils": "1.0.0-rc.15"
+      },
+      "bin": {
+        "rolldown": "bin/cli.mjs"
+      },
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      },
+      "optionalDependencies": {
+        "@rolldown/binding-android-arm64": "1.0.0-rc.15",
+        "@rolldown/binding-darwin-arm64": "1.0.0-rc.15",
+        "@rolldown/binding-darwin-x64": "1.0.0-rc.15",
+        "@rolldown/binding-freebsd-x64": "1.0.0-rc.15",
+        "@rolldown/binding-linux-arm-gnueabihf": "1.0.0-rc.15",
+        "@rolldown/binding-linux-arm64-gnu": "1.0.0-rc.15",
+        "@rolldown/binding-linux-arm64-musl": "1.0.0-rc.15",
+        "@rolldown/binding-linux-ppc64-gnu": "1.0.0-rc.15",
+        "@rolldown/binding-linux-s390x-gnu": "1.0.0-rc.15",
+        "@rolldown/binding-linux-x64-gnu": "1.0.0-rc.15",
+        "@rolldown/binding-linux-x64-musl": "1.0.0-rc.15",
+        "@rolldown/binding-openharmony-arm64": "1.0.0-rc.15",
+        "@rolldown/binding-wasm32-wasi": "1.0.0-rc.15",
+        "@rolldown/binding-win32-arm64-msvc": "1.0.0-rc.15",
+        "@rolldown/binding-win32-x64-msvc": "1.0.0-rc.15"
+      }
+    },
+    "node_modules/scheduler": {
+      "version": "0.27.0",
+      "resolved": "https://registry.npmjs.org/scheduler/-/scheduler-0.27.0.tgz",
+      "integrity": "sha512-eNv+WrVbKu1f3vbYJT/xtiF5syA5HPIMtf9IgY/nKg0sWqzAUEvqY/xm7OcZc/qafLx/iO9FgOmeSAp4v5ti/Q==",
+      "license": "MIT"
+    },
+    "node_modules/source-map-js": {
+      "version": "1.2.1",
+      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.1.tgz",
+      "integrity": "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==",
+      "dev": true,
+      "license": "BSD-3-Clause",
+      "engines": {
+        "node": ">=0.10.0"
+      }
+    },
+    "node_modules/tinyglobby": {
+      "version": "0.2.16",
+      "resolved": "https://registry.npmjs.org/tinyglobby/-/tinyglobby-0.2.16.tgz",
+      "integrity": "sha512-pn99VhoACYR8nFHhxqix+uvsbXineAasWm5ojXoN8xEwK5Kd3/TrhNn1wByuD52UxWRLy8pu+kRMniEi6Eq9Zg==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "fdir": "^6.5.0",
+        "picomatch": "^4.0.4"
+      },
+      "engines": {
+        "node": ">=12.0.0"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/SuperchupuDev"
+      }
+    },
+    "node_modules/tslib": {
+      "version": "2.8.1",
+      "resolved": "https://registry.npmjs.org/tslib/-/tslib-2.8.1.tgz",
+      "integrity": "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==",
+      "dev": true,
+      "license": "0BSD",
+      "optional": true
+    },
+    "node_modules/uuid": {
+      "version": "9.0.1",
+      "resolved": "https://registry.npmjs.org/uuid/-/uuid-9.0.1.tgz",
+      "integrity": "sha512-b+1eJOlsR9K8HJpow9Ok3fiWOWSIcIzXodvv0rQjVoOVNpWMpxf1wZNpt4y9h10odCNrqnYp1OBzRktckBe3sA==",
+      "funding": [
+        "https://github.com/sponsors/broofa",
+        "https://github.com/sponsors/ctavan"
+      ],
+      "license": "MIT",
+      "bin": {
+        "uuid": "dist/bin/uuid"
+      }
+    },
+    "node_modules/vite": {
+      "version": "8.0.8",
+      "resolved": "https://registry.npmjs.org/vite/-/vite-8.0.8.tgz",
+      "integrity": "sha512-dbU7/iLVa8KZALJyLOBOQ88nOXtNG8vxKuOT4I2mD+Ya70KPceF4IAmDsmU0h1Qsn5bPrvsY9HJstCRh3hG6Uw==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "lightningcss": "^1.32.0",
+        "picomatch": "^4.0.4",
+        "postcss": "^8.5.8",
+        "rolldown": "1.0.0-rc.15",
+        "tinyglobby": "^0.2.15"
+      },
+      "bin": {
+        "vite": "bin/vite.js"
+      },
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      },
+      "funding": {
+        "url": "https://github.com/vitejs/vite?sponsor=1"
+      },
+      "optionalDependencies": {
+        "fsevents": "~2.3.3"
+      },
+      "peerDependencies": {
+        "@types/node": "^20.19.0 || >=22.12.0",
+        "@vitejs/devtools": "^0.1.0",
+        "esbuild": "^0.27.0 || ^0.28.0",
+        "jiti": ">=1.21.0",
+        "less": "^4.0.0",
+        "sass": "^1.70.0",
+        "sass-embedded": "^1.70.0",
+        "stylus": ">=0.54.8",
+        "sugarss": "^5.0.0",
+        "terser": "^5.16.0",
+        "tsx": "^4.8.1",
+        "yaml": "^2.4.2"
+      },
+      "peerDependenciesMeta": {
+        "@types/node": {
+          "optional": true
+        },
+        "@vitejs/devtools": {
+          "optional": true
+        },
+        "esbuild": {
+          "optional": true
+        },
+        "jiti": {
+          "optional": true
+        },
+        "less": {
+          "optional": true
+        },
+        "sass": {
+          "optional": true
+        },
+        "sass-embedded": {
+          "optional": true
+        },
+        "stylus": {
+          "optional": true
+        },
+        "sugarss": {
+          "optional": true
+        },
+        "terser": {
+          "optional": true
+        },
+        "tsx": {
+          "optional": true
+        },
+        "yaml": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/zustand": {
+      "version": "5.0.12",
+      "resolved": "https://registry.npmjs.org/zustand/-/zustand-5.0.12.tgz",
+      "integrity": "sha512-i77ae3aZq4dhMlRhJVCYgMLKuSiZAaUPAct2AksxQ+gOtimhGMdXljRT21P5BNpeT4kXlLIckvkPM029OljD7g==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=12.20.0"
+      },
+      "peerDependencies": {
+        "@types/react": ">=18.0.0",
+        "immer": ">=9.0.6",
+        "react": ">=18.0.0",
+        "use-sync-external-store": ">=1.2.0"
+      },
+      "peerDependenciesMeta": {
+        "@types/react": {
+          "optional": true
+        },
+        "immer": {
+          "optional": true
+        },
+        "react": {
+          "optional": true
+        },
+        "use-sync-external-store": {
+          "optional": true
+        }
+      }
+    }
+  }
+}
+
+
+
+================================================================================
+FILE: frontend\package.json
+================================================================================
+
+{
+  "name": "frontend",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.1",
+    "vite": "^8.0.4"
+  },
+  "dependencies": {
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "uuid": "^9.0.1",
+    "zustand": "^5.0.12"
+  }
+}
+
+
+
+================================================================================
+FILE: frontend\vite.config.js
+================================================================================
+
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+});
+
+
+
+================================================================================
+FILE: frontend\src\App.jsx
+================================================================================
+
+import { Component } from 'react';
+import useAppStore from './store/useAppStore';
+import LoginModal from './components/LoginModal';
+import MainPage from './pages/MainPage';
+import './styles/global.css';
+
+function hardReset() {
+  localStorage.clear();
+  sessionStorage.clear();
+  window.location.href = window.location.href; // force full reload
+}
+
+class ErrorBoundary extends Component {
+  state = { error: null };
+  static getDerivedStateFromError(error) { return { error }; }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{
+          padding: 40, fontFamily: 'monospace', color: '#dc2626',
+          background: '#fdf2f2', minHeight: '100vh'
+        }}>
+          <h2>Something went wrong</h2>
+          <pre style={{ marginTop: 16, whiteSpace: 'pre-wrap', fontSize: 13 }}>
+            {this.state.error.message}
+          </pre>
+          <button
+            style={{
+              marginTop: 24, padding: '10px 20px', cursor: 'pointer',
+              background: '#dc2626', color: '#fff', border: 'none',
+              borderRadius: 8, fontSize: 14, fontWeight: 600
+            }}
+            onClick={hardReset}
+          >
+            Clear all data &amp; reload
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function AppInner() {
+  const user = useAppStore((s) => s.user);
+  return (
+    <>
+      {!user && <LoginModal />}
+      <MainPage />
+    </>
+  );
+}
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppInner />
+    </ErrorBoundary>
+  );
+}
+
+
+
+================================================================================
+FILE: frontend\src\main.jsx
+================================================================================
+
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>
+);
+
+
+
+================================================================================
+FILE: frontend\src\api\index.js
+================================================================================
+
+// api/index.js
+const BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
+
+function authHeaders(token) {
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+async function _post(path, body, token) {
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body:    JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({ detail: res.statusText }));
+  if (!res.ok) throw new Error(data.detail ?? 'Request failed');
+  return data;
+}
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+export async function login(username, password) {
+  // returns { username, token }
+  return _post('/login', { username, password });
+}
+
+export async function register(username, password) {
+  // returns { message }
+  return _post('/register', { username, password });
+}
+
+// ── PDF Upload ────────────────────────────────────────────────────────────────
+export async function uploadPdf(file, chatId, token) {
+  const form = new FormData();
+  form.append('file', file);
+
+  const res = await fetch(
+    `${BASE_URL}/upload?chat_id=${encodeURIComponent(chatId)}`,
+    { method: 'POST', headers: authHeaders(token), body: form }
+  );
+  const data = await res.json().catch(() => ({ detail: res.statusText }));
+  if (!res.ok) throw new Error(data.detail ?? 'Upload failed');
+  return data; // { id, name, path }
+}
+
+// ── Query ─────────────────────────────────────────────────────────────────────
+export async function sendQuery(query, selectedPdfs, chatId, token) {
+  return _post('/query', {
+    query,
+    pdfs:    selectedPdfs.map((p) => p.path),
+    chat_id: chatId,
+  }, token);
+}
+
+
+
+================================================================================
+FILE: frontend\src\components\ChatArea.jsx
+================================================================================
+
+import { useEffect, useRef, useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
+import useAppStore from '../store/useAppStore';
+import { sendQuery } from '../api';
+import MessageBubble from './MessageBubble';
+import InputBar from './InputBar';
+import FeatureGrid from './FeatureGrid';
+import '../styles/ChatArea.css';
+
+export default function ChatArea() {
+  const addMessage     = useAppStore((s) => s.addMessage);
+  const token          = useAppStore((s) => s.user?.token);
+  const selectedChatId = useAppStore((s) => s.users[s.user?.username]?.selectedChatId ?? null);
+
+  const chat = useAppStore(
+    useShallow((s) => {
+      const u  = s.user?.username;
+      const id = s.users[u]?.selectedChatId;
+      return s.users[u]?.chats?.find((c) => c.id === id) ?? null;
+    })
+  );
+
+  const [loading, setLoading] = useState(false);
+  const bottomRef = useRef();
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chat?.messages?.length]);
+
+  const handleSend = async (text) => {
+    if (!chat || chat.selectedPdfIds.length === 0) return;
+    const selectedPdfs = chat.pdfs.filter((p) => chat.selectedPdfIds.includes(p.id));
+
+    addMessage(selectedChatId, {
+      id: crypto.randomUUID(), role: 'user', content: text, timestamp: Date.now(),
+    });
+
+    setLoading(true);
+    try {
+      const result = await sendQuery(text, selectedPdfs, selectedChatId, token);
+      addMessage(selectedChatId, {
+        id:          crypto.randomUUID(),
+        role:        'assistant',
+        content:     result.answer,
+        doc1_answer: result.doc1_answer || '',
+        doc2_answer: result.doc2_answer || '',
+        comparison:  result.comparison  || '',
+        images:      result.images      || [],
+        tables:      result.tables      || [],
+        visuals:     result.visuals     || '',
+        timestamp:   Date.now(),
+      });
+    } catch (err) {
+      addMessage(selectedChatId, {
+        id: crypto.randomUUID(), role: 'assistant',
+        content: `⚠️ ${err.message}`, timestamp: Date.now(),
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ChatArea is only rendered when a chat IS active (MainPage handles the gate)
+  const noPdfSelected = chat && chat.selectedPdfIds.length === 0;
+  const isEmpty       = chat && chat.messages.length === 0;
+
+  return (
+    <main className="chat-area">
+      <div className="chat-messages">
+        {isEmpty
+          ? <FeatureGrid />
+          : chat.messages.map((msg) => <MessageBubble key={msg.id} message={msg} />)
+        }
+        {loading && (
+          <div className="bubble-row assistant">
+            <div className="bubble-avatar">🧠</div>
+            <div className="bubble bubble-assistant typing">
+              <span className="dot" /><span className="dot" /><span className="dot" />
+            </div>
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+      <InputBar onSend={handleSend} disabled={noPdfSelected} loading={loading} />
+    </main>
+  );
+}
+
+
+
+================================================================================
+FILE: frontend\src\components\ChatList.jsx
+================================================================================
+
+import { useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
+import useAppStore from '../store/useAppStore';
+
+export default function ChatList({ groupId }) {
+  const selectedChatId = useAppStore((s) => s.users[s.user?.username]?.selectedChatId ?? null);
+
+  const groupChats = useAppStore(
+    useShallow((s) => (s.users[s.user?.username]?.chats ?? []).filter((c) => c.groupId === groupId))
+  );
+
+  const selectChat = useAppStore((s) => s.selectChat);
+  const renameChat = useAppStore((s) => s.renameChat);
+  const deleteChat = useAppStore((s) => s.deleteChat);
+
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName]   = useState('');
+
+  const startEdit = (e, chat) => {
+    e.stopPropagation();
+    setEditingId(chat.id);
+    setEditName(chat.name);
+  };
+
+  const commitEdit = (chatId) => {
+    if (editName.trim()) renameChat(chatId, editName.trim());
+    setEditingId(null);
+  };
+
+  if (groupChats.length === 0) return <p className="empty-hint indent">No chats yet.</p>;
+
+  return (
+    <div className="chat-list">
+      {groupChats.map((chat) => (
+        <div
+          key={chat.id}
+          className={`chat-item ${selectedChatId === chat.id ? 'active' : ''}`}
+          onClick={() => selectChat(chat.id)}
+        >
+          <span className="chat-icon">💬</span>
+
+          {editingId === chat.id ? (
+            <input
+              className="inline-edit"
+              value={editName}
+              autoFocus
+              onChange={(e) => setEditName(e.target.value)}
+              onBlur={() => commitEdit(chat.id)}
+              onKeyDown={(e) => e.key === 'Enter' && commitEdit(chat.id)}
+              onClick={(e) => e.stopPropagation()}
+            />
+          ) : (
+            <span className="chat-name">{chat.name}</span>
+          )}
+
+          <div className="chat-actions">
+            <button className="icon-btn sm" onClick={(e) => startEdit(e, chat)}>✏️</button>
+            <button className="icon-btn sm danger"
+              onClick={(e) => { e.stopPropagation(); deleteChat(chat.id); }}>🗑</button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
+
+================================================================================
+FILE: frontend\src\components\FeatureGrid.jsx
+================================================================================
+
+import '../styles/FeatureGrid.css';
+
+const FEATURES = [
+  {
+    icon: '📄',
+    title: 'Multi-PDF Comparison',
+    desc: 'Upload two documents and get side-by-side AI analysis.',
+  },
+  {
+    icon: '🧠',
+    title: 'Context-Aware Memory',
+    desc: 'Follow-up questions build on previous answers automatically.',
+  },
+  {
+    icon: '🔍',
+    title: 'Structured Retrieval',
+    desc: 'Hybrid BM25 + semantic search with cross-encoder reranking.',
+  },
+  {
+    icon: '🖼️',
+    title: 'Visual Extraction',
+    desc: 'Images and tables are extracted and linked to relevant chunks.',
+  },
+];
+
+export default function FeatureGrid() {
+  return (
+    <div className="feature-grid-wrapper">
+      <h1 className="hero-title">DocuMind</h1>
+      <p className="hero-sub">Your AI-powered document intelligence system</p>
+      <div className="feature-grid">
+        {FEATURES.map((f) => (
+          <div key={f.title} className="feature-card">
+            <span className="feature-icon">{f.icon}</span>
+            <h3>{f.title}</h3>
+            <p>{f.desc}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+
+================================================================================
+FILE: frontend\src\components\GroupList.jsx
+================================================================================
+
+import { useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
+import useAppStore from '../store/useAppStore';
+import ChatList from './ChatList';
+
+export default function GroupList() {
+  const username = useAppStore((s) => s.user?.username);
+  const selectedGroupId = useAppStore((s) => s.users[username]?.selectedGroupId ?? null);
+
+  // useShallow prevents new-reference re-renders for arrays
+  const groups = useAppStore(
+    useShallow((s) => s.users[s.user?.username]?.groups ?? [])
+  );
+
+  const createGroup = useAppStore((s) => s.createGroup);
+  const renameGroup = useAppStore((s) => s.renameGroup);
+  const deleteGroup = useAppStore((s) => s.deleteGroup);
+  const selectGroup = useAppStore((s) => s.selectGroup);
+  const createChat  = useAppStore((s) => s.createChat);
+
+  const [newGroupName, setNewGroupName] = useState('');
+  const [editingId, setEditingId]       = useState(null);
+  const [editName, setEditName]         = useState('');
+
+  const handleCreate = () => {
+    createGroup(newGroupName.trim() || 'New Group');
+    setNewGroupName('');
+  };
+
+  const startEdit = (e, group) => {
+    e.stopPropagation();
+    setEditingId(group.id);
+    setEditName(group.name);
+  };
+
+  const commitEdit = (groupId) => {
+    if (editName.trim()) renameGroup(groupId, editName.trim());
+    setEditingId(null);
+  };
+
+  return (
+    <div className="group-list">
+      <div className="new-group-row">
+        <input
+          placeholder="Group name…"
+          value={newGroupName}
+          onChange={(e) => setNewGroupName(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && handleCreate()}
+        />
+        <button className="icon-btn" onClick={handleCreate} title="Create group">＋</button>
+      </div>
+
+      {groups.length === 0 && <p className="empty-hint">No groups yet.</p>}
+
+      {groups.map((group) => (
+        <div key={group.id} className="group-item">
+          <div
+            className={`group-header ${selectedGroupId === group.id ? 'active' : ''}`}
+            onClick={() => selectGroup(selectedGroupId === group.id ? null : group.id)}
+          >
+            <span className="group-icon">📁</span>
+
+            {editingId === group.id ? (
+              <input
+                className="inline-edit"
+                value={editName}
+                autoFocus
+                onChange={(e) => setEditName(e.target.value)}
+                onBlur={() => commitEdit(group.id)}
+                onKeyDown={(e) => e.key === 'Enter' && commitEdit(group.id)}
+                onClick={(e) => e.stopPropagation()}
+              />
+            ) : (
+              <span className="group-name">{group.name}</span>
+            )}
+
+            <div className="group-actions">
+              <button className="icon-btn sm" onClick={(e) => startEdit(e, group)}>✏️</button>
+              <button className="icon-btn sm danger"
+                onClick={(e) => { e.stopPropagation(); deleteGroup(group.id); }}>🗑</button>
+              <button className="icon-btn sm"
+                onClick={(e) => { e.stopPropagation(); createChat(group.id); }}>💬</button>
+            </div>
+          </div>
+
+          {selectedGroupId === group.id && <ChatList groupId={group.id} />}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
+
+================================================================================
+FILE: frontend\src\components\InputBar.jsx
+================================================================================
+
+import { useState } from 'react';
+import '../styles/InputBar.css';
+
+export default function InputBar({ onSend, disabled, loading }) {
+  const [text, setText] = useState('');
+
+  const handleSend = () => {
+    const trimmed = text.trim();
+    if (!trimmed || disabled || loading) return;
+    onSend(trimmed);
+    setText('');
+  };
+
+  const handleKey = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  return (
+    <div className="inputbar-wrapper">
+      <div className={`inputbar ${disabled ? 'inputbar-disabled' : ''}`}>
+        <textarea
+          className="inputbar-textarea"
+          placeholder={disabled ? 'Select at least one PDF to start chatting…' : 'Ask anything about your documents…'}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={handleKey}
+          disabled={disabled || loading}
+          rows={1}
+        />
+        <button
+          className="send-btn"
+          onClick={handleSend}
+          disabled={disabled || loading || !text.trim()}
+          title="Send"
+        >
+          {loading ? '⏳' : '➤'}
+        </button>
+      </div>
+      {disabled && (
+        <p className="inputbar-hint">Upload and select PDFs in the right panel to enable chat.</p>
+      )}
+    </div>
+  );
+}
+
+
+
+================================================================================
+FILE: frontend\src\components\LoginModal.jsx
+================================================================================
+
+import { useState } from 'react';
+import { login, register } from '../api';
+import useAppStore from '../store/useAppStore';
+import '../styles/LoginModal.css';
+
+export default function LoginModal() {
+  const setUser = useAppStore((s) => s.login);  // login(username, token)
+
+  // 'login' | 'register'
+  const [mode, setMode]         = useState('login');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError]       = useState('');
+  const [success, setSuccess]   = useState('');
+  const [loading, setLoading]   = useState(false);
+
+  const switchMode = (m) => {
+    setMode(m);
+    setError('');
+    setSuccess('');
+    setUsername('');
+    setPassword('');
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError('');
+    setSuccess('');
+    setLoading(true);
+
+    try {
+      if (mode === 'login') {
+        const res = await login(username, password);
+        setUser(res.username, res.token);
+      } else {
+        await register(username, password);
+        setSuccess('Account created! You can now log in.');
+        switchMode('login');
+      }
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="login-overlay">
+      <div className="login-box">
+        <div className="login-logo">
+          <span className="login-logo-icon">🧠</span>
+          <h1>DocuMind</h1>
+        </div>
+
+        <div className="auth-tabs">
+          <button
+            className={`auth-tab ${mode === 'login' ? 'active' : ''}`}
+            onClick={() => switchMode('login')}
+            type="button"
+          >Login</button>
+          <button
+            className={`auth-tab ${mode === 'register' ? 'active' : ''}`}
+            onClick={() => switchMode('register')}
+            type="button"
+          >Register</button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="login-form">
+          <input
+            type="text"
+            placeholder="Username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            autoFocus
+            required
+          />
+          <input
+            type="password"
+            placeholder="Password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+          />
+
+          {error   && <p className="login-error">{error}</p>}
+          {success && <p className="login-success">{success}</p>}
+
+          <button type="submit" disabled={loading}>
+            {loading
+              ? (mode === 'login' ? 'Signing in…' : 'Creating account…')
+              : (mode === 'login' ? 'Login' : 'Create Account')}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+
+
+================================================================================
+FILE: frontend\src\components\MessageBubble.jsx
+================================================================================
+
+import '../styles/MessageBubble.css';
+
+const BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
+
+// Render a 2-D array as an HTML table. First row is treated as header.
+function TableView({ rows }) {
+  if (!rows || rows.length === 0) return null;
+  const [head, ...body] = rows;
+  return (
+    <table className="extracted-table">
+      <thead>
+        <tr>
+          {head.map((cell, i) => (
+            <th key={i}>{cell ?? ''}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {body.map((row, ri) => (
+          <tr key={ri}>
+            {row.map((cell, ci) => (
+              <td key={ci}>{cell ?? ''}</td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+export default function MessageBubble({ message }) {
+  const isUser = message.role === 'user';
+  const isDual = !isUser && (message.doc1_answer || message.doc2_answer);
+
+  return (
+    <div className={`bubble-row ${isUser ? 'user' : 'assistant'}`}>
+      <div className="bubble-avatar">{isUser ? '👤' : '🧠'}</div>
+
+      <div className={`bubble ${isUser ? 'bubble-user' : 'bubble-assistant'}`}>
+
+        {/* ── Dual-doc structured answer ── */}
+        {isDual ? (
+          <div className="dual-answer">
+            {message.doc1_answer && (
+              <div className="dual-section">
+                <span className="dual-label">Doc 1</span>
+                <p className="bubble-text">{message.doc1_answer}</p>
+              </div>
+            )}
+            {message.doc2_answer && (
+              <div className="dual-section">
+                <span className="dual-label">Doc 2</span>
+                <p className="bubble-text">{message.doc2_answer}</p>
+              </div>
+            )}
+            {message.comparison && (
+              <div className="dual-section comparison">
+                <span className="dual-label">Comparison</span>
+                <p className="bubble-text">{message.comparison}</p>
+              </div>
+            )}
+          </div>
+        ) : (
+          <p className="bubble-text">{message.content}</p>
+        )}
+
+        {/* ── Images ── */}
+        {message.images?.length > 0 && (
+          <div className="bubble-images">
+            <p className="visuals-label">🖼️ Extracted Images</p>
+            <div className="image-grid">
+              {message.images.map((imgPath, i) => {
+                const filename = imgPath.replace(/\\/g, '/').split('/').pop();
+                const src = `${BASE_URL}/assets/images/${filename}`;
+                return (
+                  <a key={i} href={src} target="_blank" rel="noreferrer">
+                    <img src={src} alt={`extracted-${i}`} className="extracted-img" />
+                  </a>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* ── Tables ── */}
+        {message.tables?.length > 0 && (
+          <div className="bubble-tables">
+            <p className="visuals-label">📊 Extracted Tables</p>
+            {message.tables.map((rows, i) => (
+              <div key={i} className="table-wrapper">
+                <TableView rows={rows} />
+              </div>
+            ))}
+          </div>
+        )}
+
+        <span className="bubble-time">
+          {new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+
+
+================================================================================
+FILE: frontend\src\components\NoChatState.jsx
+================================================================================
+
+import useAppStore from '../store/useAppStore';
+import { useShallow } from 'zustand/react/shallow';
+import '../styles/NoChatState.css';
+
+export default function NoChatState() {
+  const createGroup = useAppStore((s) => s.createGroup);
+  const createChat  = useAppStore((s) => s.createChat);
+  const groups      = useAppStore(useShallow((s) => s.users[s.user?.username]?.groups ?? []));
+
+  const handleNewChat = () => {
+    if (groups.length === 0) {
+      const gid = createGroup('Default');
+      createChat(gid);
+    } else {
+      createChat(groups[0].id);
+    }
+  };
+
+  return (
+    <div className="no-chat-state">
+      <div className="no-chat-inner">
+        <span className="no-chat-icon">🧠</span>
+        <h2 className="no-chat-title">Welcome to DocuMind</h2>
+        <p className="no-chat-sub">
+          Create a new chat or open an existing one to continue
+        </p>
+        <button className="no-chat-btn" onClick={handleNewChat}>
+          ＋ New Chat
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+
+================================================================================
+FILE: frontend\src\components\PdfSelector.jsx
+================================================================================
+
+import { useRef, useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
+import useAppStore from '../store/useAppStore';
+import { uploadPdf } from '../api';
+import '../styles/PdfSelector.css';
+
+export default function PdfSelector() {
+  const addPdf             = useAppStore((s) => s.addPdf);
+  const removePdf          = useAppStore((s) => s.removePdf);
+  const togglePdfSelection = useAppStore((s) => s.togglePdfSelection);
+  const token              = useAppStore((s) => s.user?.token);
+  const selectedChatId     = useAppStore((s) => s.users[s.user?.username]?.selectedChatId ?? null);
+
+  const chat = useAppStore(
+    useShallow((s) => {
+      const u  = s.user?.username;
+      const id = s.users[u]?.selectedChatId;
+      return s.users[u]?.chats?.find((c) => c.id === id) ?? null;
+    })
+  );
+
+  const fileRef = useRef();
+  const [uploading, setUploading]     = useState(false);
+  const [uploadError, setUploadError] = useState('');
+  const [collapsed, setCollapsed]     = useState(false);
+
+  const handleUpload = async (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file || !selectedChatId) return;
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      setUploadError('Only PDF files are accepted.');
+      return;
+    }
+    setUploadError('');
+    setUploading(true);
+    try {
+      const pdf = await uploadPdf(file, selectedChatId, token);
+      addPdf(selectedChatId, pdf);
+    } catch (err) {
+      setUploadError(err.message);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const canUpload = chat && chat.pdfs.length < 2 && !uploading;
+
+  // Not rendered at all when no chat — MainPage handles that
+  if (!chat) return null;
+
+  return (
+    <div className={`pdf-float ${collapsed ? 'pdf-float--collapsed' : ''}`}>
+      {/* Header row with collapse toggle */}
+      <div className="pdf-float-header" onClick={() => setCollapsed((v) => !v)}>
+        <span className="pdf-selector-title">📎 Documents</span>
+        <button className="pdf-collapse-btn" title={collapsed ? 'Expand' : 'Collapse'}>
+          {collapsed ? '▾' : '▴'}
+        </button>
+      </div>
+
+      {!collapsed && (
+        <>
+          {/* Upload */}
+          <div className="pdf-upload-area">
+            <input ref={fileRef} type="file" accept=".pdf"
+              style={{ display: 'none' }} onChange={handleUpload} />
+            <button
+              className="upload-btn"
+              onClick={() => { setUploadError(''); fileRef.current.click(); }}
+              disabled={!canUpload}
+              title={canUpload ? 'Upload a PDF (max 2)' : 'Max 2 PDFs per chat'}
+            >
+              {uploading ? '⏳ Uploading…' : '＋ Upload PDF'}
+            </button>
+            {uploadError && <p className="pdf-error">{uploadError}</p>}
+            {!canUpload && !uploading && chat.pdfs.length >= 2 && (
+              <p className="pdf-hint">Max 2 PDFs per chat.</p>
+            )}
+          </div>
+
+          {/* PDF list */}
+          <div className="pdf-list">
+            {chat.pdfs.length === 0 ? (
+              <p className="pdf-hint">No PDFs uploaded yet.</p>
+            ) : chat.pdfs.map((pdf) => {
+              const selected = chat.selectedPdfIds.includes(pdf.id);
+              return (
+                <div key={pdf.id} className={`pdf-item ${selected ? 'pdf-selected' : ''}`}>
+                  <label className="pdf-label">
+                    <input type="checkbox" checked={selected}
+                      onChange={() => togglePdfSelection(selectedChatId, pdf.id)} />
+                    <span className="pdf-icon">📄</span>
+                    <span className="pdf-name" title={pdf.name}>{pdf.name}</span>
+                  </label>
+                  <button className="icon-btn sm danger"
+                    onClick={() => removePdf(selectedChatId, pdf.id)} title="Remove">✕</button>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Mode badge */}
+          <div className="pdf-mode-badge">
+            {chat.selectedPdfIds.length === 0 && <span className="badge badge-off">No PDF selected</span>}
+            {chat.selectedPdfIds.length === 1 && <span className="badge badge-single">Single mode</span>}
+            {chat.selectedPdfIds.length === 2 && <span className="badge badge-dual">Dual compare mode</span>}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+
+
+================================================================================
+FILE: frontend\src\components\Sidebar.jsx
+================================================================================
+
+import { useShallow } from 'zustand/react/shallow';
+import useAppStore from '../store/useAppStore';
+import GroupList from './GroupList';
+import '../styles/Sidebar.css';
+
+export default function Sidebar() {
+  const user            = useAppStore((s) => s.user);
+  const logout          = useAppStore((s) => s.logout);
+  const createGroup     = useAppStore((s) => s.createGroup);
+  const createChat      = useAppStore((s) => s.createChat);
+  const selectedGroupId = useAppStore((s) => s.users[s.user?.username]?.selectedGroupId ?? null);
+
+  const groups = useAppStore(
+    useShallow((s) => s.users[s.user?.username]?.groups ?? [])
+  );
+
+  const handleNewChat = () => {
+    if (groups.length === 0) {
+      const gid = createGroup('Default');
+      createChat(gid);
+    } else {
+      createChat(selectedGroupId ?? groups[0].id);
+    }
+  };
+
+  return (
+    <aside className="sidebar">
+      <div className="sidebar-header">
+        <div className="sidebar-brand">
+          <span className="brand-icon">🧠</span>
+          <span className="brand-name">DocuMind</span>
+        </div>
+        <button className="new-chat-btn" onClick={handleNewChat}>＋ New Chat</button>
+      </div>
+      <div className="sidebar-body"><GroupList /></div>
+      <div className="sidebar-footer">
+        <span className="user-badge">👤 {user?.username}</span>
+        <button className="logout-btn" onClick={logout}>Logout</button>
+      </div>
+    </aside>
+  );
+}
+
+
+
+================================================================================
+FILE: frontend\src\components\TopBar.jsx
+================================================================================
+
+import { useShallow } from 'zustand/react/shallow';
+import useAppStore from '../store/useAppStore';
+import '../styles/TopBar.css';
+
+export default function TopBar() {
+  const selectChat      = useAppStore((s) => s.selectChat);
+  const selectedGroupId = useAppStore((s) => s.users[s.user?.username]?.selectedGroupId ?? null);
+  const selectedChatId  = useAppStore((s) => s.users[s.user?.username]?.selectedChatId  ?? null);
+
+  const groups = useAppStore(
+    useShallow((s) => s.users[s.user?.username]?.groups ?? [])
+  );
+  const chats = useAppStore(
+    useShallow((s) => s.users[s.user?.username]?.chats ?? [])
+  );
+
+  const group      = groups.find((g) => g.id === selectedGroupId) ?? null;
+  const groupChats = chats.filter((c) => c.groupId === selectedGroupId);
+
+  return (
+    <header className="topbar">
+      <div className="topbar-left">
+        {group
+          ? <span className="topbar-group-name">📁 {group.name}</span>
+          : <span className="topbar-placeholder">Select a group to see chats</span>}
+      </div>
+      <div className="topbar-chats">
+        {groupChats.map((chat) => (
+          <button
+            key={chat.id}
+            className={`topbar-chat-tab ${selectedChatId === chat.id ? 'active' : ''}`}
+            onClick={() => selectChat(chat.id)}
+          >
+            {chat.name}
+          </button>
+        ))}
+      </div>
+    </header>
+  );
+}
+
+
+
+================================================================================
+FILE: frontend\src\pages\MainPage.jsx
+================================================================================
+
+import { useShallow } from 'zustand/react/shallow';
+import useAppStore from '../store/useAppStore';
+import Sidebar from '../components/Sidebar';
+import TopBar from '../components/TopBar';
+import ChatArea from '../components/ChatArea';
+import PdfSelector from '../components/PdfSelector';
+import NoChatState from '../components/NoChatState';
+import '../styles/MainPage.css';
+
+export default function MainPage() {
+  const chat = useAppStore(
+    useShallow((s) => {
+      const u  = s.user?.username;
+      const id = s.users[u]?.selectedChatId;
+      return s.users[u]?.chats?.find((c) => c.id === id) ?? null;
+    })
+  );
+
+  const hasChat = !!chat;
+
+  return (
+    <div className="app-layout">
+      <Sidebar />
+      <div className="app-center">
+        <TopBar />
+        {hasChat ? <ChatArea /> : <NoChatState />}
+      </div>
+      {/* Floating PDF panel — only shown when a chat is active */}
+      {hasChat && <PdfSelector />}
+    </div>
+  );
+}
+
+
+
+================================================================================
+FILE: frontend\src\store\useAppStore.js
+================================================================================
+
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+
+const uuid = () => crypto.randomUUID();
+
+// Stable empty references — never recreated, so selector equality checks pass
+const EMPTY_GROUPS = [];
+const EMPTY_CHATS  = [];
+
+const emptyWorkspace = () => ({
+  groups:          EMPTY_GROUPS,
+  chats:           EMPTY_CHATS,
+  selectedGroupId: null,
+  selectedChatId:  null,
+});
+
+const withWs = (state, updater) => {
+  const username = state.user?.username;
+  if (!username) return state;
+  const current = state.users[username] ?? emptyWorkspace();
+  const patch   = typeof updater === 'function' ? updater(current) : updater;
+  return { users: { ...state.users, [username]: { ...current, ...patch } } };
+};
+
+const useAppStore = create(
+  persist(
+    (set, get) => ({
+      user:  null,
+      users: {},
+
+      // ── Auth ──────────────────────────────────────────────
+      login: (username, token) =>
+        set((s) => ({
+          user:  { username, token },
+          users: s.users[username]
+            ? s.users
+            : { ...s.users, [username]: emptyWorkspace() },
+        })),
+
+      logout: () => set({ user: null }),
+
+      // ── Groups ────────────────────────────────────────────
+      createGroup: (name) => {
+        const group = { id: uuid(), name, chatIds: [] };
+        set((s) => withWs(s, (ws) => ({ groups: [...ws.groups, group] })));
+        return group.id;
+      },
+
+      renameGroup: (groupId, name) =>
+        set((s) => withWs(s, (ws) => ({
+          groups: ws.groups.map((g) => (g.id === groupId ? { ...g, name } : g)),
+        }))),
+
+      deleteGroup: (groupId) =>
+        set((s) => withWs(s, (ws) => ({
+          groups:          ws.groups.filter((g) => g.id !== groupId),
+          chats:           ws.chats.filter((c) => c.groupId !== groupId),
+          selectedGroupId: ws.selectedGroupId === groupId ? null : ws.selectedGroupId,
+          selectedChatId:
+            ws.chats.find((c) => c.groupId === groupId && c.id === ws.selectedChatId)
+              ? null : ws.selectedChatId,
+        }))),
+
+      selectGroup: (groupId) =>
+        set((s) => withWs(s, { selectedGroupId: groupId })),
+
+      // ── Chats ─────────────────────────────────────────────
+      createChat: (groupId, name = 'New Chat') => {
+        const chat = { id: uuid(), name, groupId, messages: [], pdfs: [], selectedPdfIds: [] };
+        set((s) => withWs(s, (ws) => ({
+          chats:           [...ws.chats, chat],
+          groups:          ws.groups.map((g) =>
+            g.id === groupId ? { ...g, chatIds: [...g.chatIds, chat.id] } : g
+          ),
+          selectedChatId:  chat.id,
+          selectedGroupId: groupId,
+        })));
+        return chat.id;
+      },
+
+      renameChat: (chatId, name) =>
+        set((s) => withWs(s, (ws) => ({
+          chats: ws.chats.map((c) => (c.id === chatId ? { ...c, name } : c)),
+        }))),
+
+      deleteChat: (chatId) =>
+        set((s) => withWs(s, (ws) => {
+          const chat = ws.chats.find((c) => c.id === chatId);
+          return {
+            chats:  ws.chats.filter((c) => c.id !== chatId),
+            groups: ws.groups.map((g) =>
+              g.id === chat?.groupId
+                ? { ...g, chatIds: g.chatIds.filter((id) => id !== chatId) }
+                : g
+            ),
+            selectedChatId: ws.selectedChatId === chatId ? null : ws.selectedChatId,
+          };
+        })),
+
+      selectChat: (chatId) =>
+        set((s) => {
+          const ws   = s.users[s.user?.username] ?? emptyWorkspace();
+          const chat = ws.chats.find((c) => c.id === chatId);
+          return withWs(s, {
+            selectedChatId:  chatId,
+            selectedGroupId: chat?.groupId ?? ws.selectedGroupId,
+          });
+        }),
+
+      // ── Messages ──────────────────────────────────────────
+      addMessage: (chatId, message) =>
+        set((s) => withWs(s, (ws) => ({
+          chats: ws.chats.map((c) =>
+            c.id === chatId ? { ...c, messages: [...c.messages, message] } : c
+          ),
+        }))),
+
+      // ── PDFs ──────────────────────────────────────────────
+      addPdf: (chatId, pdf) =>
+        set((s) => withWs(s, (ws) => ({
+          chats: ws.chats.map((c) => {
+            if (c.id !== chatId || c.pdfs.length >= 2) return c;
+            if (c.pdfs.find((p) => p.id === pdf.id)) return c;
+            return { ...c, pdfs: [...c.pdfs, pdf] };
+          }),
+        }))),
+
+      removePdf: (chatId, pdfId) =>
+        set((s) => withWs(s, (ws) => ({
+          chats: ws.chats.map((c) =>
+            c.id === chatId
+              ? { ...c,
+                  pdfs:           c.pdfs.filter((p) => p.id !== pdfId),
+                  selectedPdfIds: c.selectedPdfIds.filter((id) => id !== pdfId) }
+              : c
+          ),
+        }))),
+
+      togglePdfSelection: (chatId, pdfId) =>
+        set((s) => withWs(s, (ws) => ({
+          chats: ws.chats.map((c) => {
+            if (c.id !== chatId) return c;
+            const sel = c.selectedPdfIds.includes(pdfId)
+              ? c.selectedPdfIds.filter((id) => id !== pdfId)
+              : [...c.selectedPdfIds, pdfId].slice(-2);
+            return { ...c, selectedPdfIds: sel };
+          }),
+        }))),
+    }),
+    {
+      name:       'documind-storage',
+      partialize: (s) => ({ user: s.user, users: s.users }),
+    }
+  )
+);
+
+export default useAppStore;
+
+
+
+================================================================================
+FILE: frontend\src\styles\ChatArea.css
+================================================================================
+
+.chat-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--beige-light);
+}
+
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  /* right padding keeps messages clear of the floating PDF panel */
+  padding: 24px 300px 24px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--beige-dark) transparent;
+}
+
+/* On smaller screens collapse the right padding */
+@media (max-width: 900px) {
+  .chat-messages { padding: 20px 20px 20px 20px; }
+}
+
+/* Typing indicator */
+.typing {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 16px;
+  min-width: 56px;
+}
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green-mid);
+  animation: bounce 1.2s infinite;
+}
+.dot:nth-child(2) { animation-delay: .2s; }
+.dot:nth-child(3) { animation-delay: .4s; }
+
+@keyframes bounce {
+  0%, 80%, 100% { transform: translateY(0); opacity: .5; }
+  40%            { transform: translateY(-6px); opacity: 1; }
+}
+
+
+
+================================================================================
+FILE: frontend\src\styles\FeatureGrid.css
+================================================================================
+
+.feature-grid-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  padding: 40px 24px;
+  text-align: center;
+}
+
+.hero-title {
+  font-size: 64px;
+  font-weight: 800;
+  color: rgba(45, 106, 79, 0.08);
+  letter-spacing: -2px;
+  line-height: 1;
+  margin-bottom: 8px;
+  user-select: none;
+  pointer-events: none;
+}
+
+.hero-sub {
+  font-size: 14px;
+  color: var(--text-muted);
+  margin-bottom: 32px;
+}
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 14px;
+  max-width: 560px;
+  width: 100%;
+}
+
+.feature-card {
+  background: var(--beige-white);
+  border: 1px solid var(--beige-mid);
+  border-radius: var(--radius-md);
+  padding: 20px 18px;
+  text-align: left;
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow .2s, transform .2s;
+}
+.feature-card:hover {
+  box-shadow: var(--shadow-md);
+  transform: translateY(-2px);
+}
+
+.feature-icon { font-size: 24px; display: block; margin-bottom: 8px; }
+
+.feature-card h3 {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--green-dark);
+  margin-bottom: 4px;
+}
+
+.feature-card p {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+
+
+================================================================================
+FILE: frontend\src\styles\global.css
+================================================================================
+
+/* ── Reset & Base ─────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --green-dark:   #2d6a4f;
+  --green-mid:    #40916c;
+  --green-light:  #74c69d;
+  --green-pale:   #d8f3dc;
+  --beige-dark:   #c9b99a;
+  --beige-mid:    #e8dcc8;
+  --beige-light:  #f5f0e8;
+  --beige-white:  #fdfaf5;
+  --text-dark:    #1a1a1a;
+  --text-mid:     #444;
+  --text-muted:   #888;
+  --shadow-sm:    0 1px 4px rgba(0,0,0,.08);
+  --shadow-md:    0 4px 16px rgba(0,0,0,.12);
+  --radius-sm:    6px;
+  --radius-md:    12px;
+  --radius-lg:    20px;
+  --sidebar-w:    260px;
+  --pdf-panel-w:  220px;
+  --topbar-h:     52px;
+  --font:         'Inter', system-ui, sans-serif;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  font-family: var(--font);
+  background: var(--beige-light);
+  color: var(--text-dark);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow: hidden;
+}
+
+button { cursor: pointer; font-family: inherit; }
+input, textarea { font-family: inherit; }
+
+/* ── Shared utility ───────────────────────────────────────── */
+.icon-btn {
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  opacity: 0.6;
+  transition: opacity .15s, background .15s;
+}
+.icon-btn:hover { opacity: 1; background: rgba(0,0,0,.06); }
+.icon-btn.sm { font-size: 11px; }
+.icon-btn.danger:hover { background: #fee2e2; }
+
+.inline-edit {
+  background: var(--beige-white);
+  border: 1px solid var(--green-light);
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  font-size: 13px;
+  width: 100%;
+  outline: none;
+}
+
+.empty-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 6px 8px;
+}
+.empty-hint.indent { padding-left: 28px; }
+
+
+
+================================================================================
+FILE: frontend\src\styles\InputBar.css
+================================================================================
+
+.inputbar-wrapper {
+  padding: 12px 32px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.inputbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  background: var(--beige-white);
+  border: 1.5px solid var(--beige-dark);
+  border-radius: var(--radius-lg);
+  padding: 10px 14px;
+  box-shadow: var(--shadow-sm);
+  transition: border-color .15s, box-shadow .15s;
+}
+
+.inputbar:focus-within {
+  border-color: var(--green-mid);
+  box-shadow: 0 0 0 3px rgba(64,145,108,.12);
+}
+
+.inputbar-disabled {
+  opacity: .55;
+  pointer-events: none;
+}
+
+.inputbar-textarea {
+  flex: 1;
+  border: none;
+  background: transparent;
+  resize: none;
+  font-size: 14px;
+  line-height: 1.5;
+  outline: none;
+  max-height: 140px;
+  overflow-y: auto;
+  color: var(--text-dark);
+}
+.inputbar-textarea::placeholder { color: var(--text-muted); }
+
+.send-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--green-mid);
+  color: #fff;
+  border: none;
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background .15s, transform .1s;
+}
+.send-btn:hover:not(:disabled) {
+  background: var(--green-dark);
+  transform: scale(1.05);
+}
+.send-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+.inputbar-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+
+
+================================================================================
+FILE: frontend\src\styles\LoginModal.css
+================================================================================
+
+.login-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(45, 106, 79, 0.35);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.login-box {
+  background: var(--beige-white);
+  border-radius: var(--radius-lg);
+  padding: 40px 36px;
+  width: 360px;
+  box-shadow: var(--shadow-md), 0 0 0 1px rgba(116,198,157,.3);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  animation: fadeUp .25s ease;
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.login-logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  justify-content: center;
+}
+.login-logo-icon { font-size: 28px; }
+.login-logo h1 {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--green-dark);
+  letter-spacing: -.5px;
+}
+
+.login-subtitle {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.login-form input {
+  padding: 10px 14px;
+  border: 1.5px solid var(--beige-dark);
+  border-radius: var(--radius-md);
+  background: var(--beige-light);
+  font-size: 14px;
+  outline: none;
+  transition: border-color .15s;
+}
+.login-form input:focus { border-color: var(--green-mid); }
+
+.login-form button {
+  padding: 11px;
+  background: var(--green-mid);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-md);
+  font-size: 15px;
+  font-weight: 600;
+  transition: background .15s;
+  margin-top: 4px;
+}
+.login-form button:hover:not(:disabled) { background: var(--green-dark); }
+.login-form button:disabled { opacity: .6; cursor: not-allowed; }
+
+.login-error {
+  color: #dc2626;
+  font-size: 12px;
+  text-align: center;
+}
+
+/* ── Auth tabs ───────────────────────────────────────────── */
+.auth-tabs {
+  display: flex;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  border: 1.5px solid var(--beige-dark);
+  margin-bottom: 4px;
+}
+
+.auth-tab {
+  flex: 1;
+  padding: 8px;
+  background: transparent;
+  border: none;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.auth-tab:hover { background: var(--beige-mid); color: var(--text-dark); }
+.auth-tab.active {
+  background: var(--green-mid);
+  color: #fff;
+}
+
+.login-success {
+  color: var(--green-dark);
+  font-size: 12px;
+  text-align: center;
+  background: var(--green-pale);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+}
+
+
+
+================================================================================
+FILE: frontend\src\styles\MainPage.css
+================================================================================
+
+.app-layout {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Center column — takes all remaining space */
+.app-center {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+
+
+================================================================================
+FILE: frontend\src\styles\MessageBubble.css
+================================================================================
+
+.bubble-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  max-width: 780px;
+  width: 100%;
+}
+
+.bubble-row.user {
+  flex-direction: row-reverse;
+  align-self: flex-end;
+}
+
+.bubble-row.assistant {
+  align-self: flex-start;
+}
+
+.bubble-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--beige-mid);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  flex-shrink: 0;
+  box-shadow: var(--shadow-sm);
+}
+
+.bubble {
+  padding: 12px 16px;
+  border-radius: var(--radius-md);
+  max-width: 72%;
+  box-shadow: var(--shadow-sm);
+  position: relative;
+}
+
+.bubble-user {
+  background: var(--green-mid);
+  color: #fff;
+  border-bottom-right-radius: 4px;
+}
+
+.bubble-assistant {
+  background: var(--beige-white);
+  color: var(--text-dark);
+  border: 1px solid var(--beige-mid);
+  border-bottom-left-radius: 4px;
+}
+
+.bubble-text {
+  font-size: 14px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.bubble-visuals {
+  margin-top: 10px;
+  font-size: 11px;
+  background: var(--beige-light);
+  border: 1px solid var(--beige-mid);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  overflow-x: auto;
+  color: var(--text-mid);
+  white-space: pre-wrap;
+}
+
+.bubble-time {
+  display: block;
+  font-size: 10px;
+  color: rgba(0,0,0,.3);
+  margin-top: 6px;
+  text-align: right;
+}
+.bubble-user .bubble-time { color: rgba(255,255,255,.5); }
+
+/* ── Dual-doc sections ───────────────────────────────────── */
+.dual-answer { display: flex; flex-direction: column; gap: 10px; }
+
+.dual-section {
+  border-left: 3px solid var(--green-light);
+  padding-left: 10px;
+}
+.dual-section.comparison {
+  border-left-color: var(--beige-dark);
+}
+
+.dual-label {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  color: var(--green-dark);
+  background: var(--green-pale);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-bottom: 4px;
+}
+.dual-section.comparison .dual-label {
+  color: var(--text-mid);
+  background: var(--beige-mid);
+}
+
+/* ── Visuals ─────────────────────────────────────────────── */
+.visuals-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-mid);
+  margin: 10px 0 6px;
+}
+
+.image-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.extracted-img {
+  max-width: 140px;
+  max-height: 100px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--beige-mid);
+  cursor: pointer;
+  transition: transform .15s;
+}
+.extracted-img:hover { transform: scale(1.04); }
+
+.table-preview {
+  font-size: 11px;
+  background: var(--beige-light);
+  border: 1px solid var(--beige-mid);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  color: var(--text-mid);
+  margin-bottom: 6px;
+}
+
+/* ── Extracted table ─────────────────────────────────────── */
+.table-wrapper {
+  overflow-x: auto;
+  margin-top: 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--beige-mid);
+}
+
+.extracted-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  color: var(--text-dark);
+  background: var(--beige-white);
+}
+
+.extracted-table th {
+  background: var(--green-pale);
+  color: var(--green-dark);
+  font-weight: 700;
+  padding: 6px 10px;
+  text-align: left;
+  border-bottom: 2px solid var(--green-light);
+  white-space: nowrap;
+}
+
+.extracted-table td {
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--beige-mid);
+  vertical-align: top;
+}
+
+.extracted-table tr:last-child td {
+  border-bottom: none;
+}
+
+.extracted-table tr:nth-child(even) td {
+  background: var(--beige-light);
+}
+
+
+
+================================================================================
+FILE: frontend\src\styles\NoChatState.css
+================================================================================
+
+.no-chat-state {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--beige-light);
+}
+
+.no-chat-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  text-align: center;
+  padding: 40px 32px;
+  background: var(--beige-white);
+  border: 1px solid var(--beige-mid);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  max-width: 380px;
+  width: 100%;
+  animation: fadeUp .25s ease;
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.no-chat-icon {
+  font-size: 48px;
+  line-height: 1;
+}
+
+.no-chat-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--green-dark);
+  letter-spacing: -.3px;
+}
+
+.no-chat-sub {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.6;
+  max-width: 280px;
+}
+
+.no-chat-btn {
+  margin-top: 6px;
+  padding: 10px 28px;
+  background: var(--green-mid);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .15s, transform .1s;
+}
+.no-chat-btn:hover {
+  background: var(--green-dark);
+  transform: translateY(-1px);
+}
+
+
+
+================================================================================
+FILE: frontend\src\styles\PdfSelector.css
+================================================================================
+
+/* ── Floating PDF panel ───────────────────────────────────── */
+.pdf-float {
+  position: fixed;
+  top: calc(var(--topbar-h) + 14px);
+  right: 16px;
+  width: 270px;
+  background: var(--beige-white);
+  border: 1px solid var(--beige-mid);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md), 0 0 0 1px rgba(116,198,157,.15);
+  display: flex;
+  flex-direction: column;
+  z-index: 100;
+  overflow: hidden;
+  animation: floatIn .2s ease;
+}
+
+@keyframes floatIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.pdf-float--collapsed {
+  width: 200px;
+}
+
+/* ── Header ───────────────────────────────────────────────── */
+.pdf-float-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--beige-mid);
+  cursor: pointer;
+  user-select: none;
+  background: var(--beige-light);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  transition: background .15s;
+}
+.pdf-float-header:hover { background: var(--beige-mid); }
+
+.pdf-selector-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--green-dark);
+  letter-spacing: .2px;
+}
+
+.pdf-collapse-btn {
+  background: none;
+  border: none;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+/* ── Upload area ──────────────────────────────────────────── */
+.pdf-upload-area {
+  padding: 10px 12px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.upload-btn {
+  width: 100%;
+  padding: 8px;
+  background: var(--green-mid);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .15s;
+}
+.upload-btn:hover:not(:disabled) { background: var(--green-dark); }
+.upload-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+/* ── PDF list ─────────────────────────────────────────────── */
+.pdf-list {
+  padding: 6px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.pdf-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 9px;
+  border-radius: var(--radius-md);
+  border: 1.5px solid var(--beige-mid);
+  background: var(--beige-light);
+  transition: border-color .15s, background .15s;
+}
+.pdf-item.pdf-selected {
+  border-color: var(--green-mid);
+  background: var(--green-pale);
+}
+
+.pdf-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  cursor: pointer;
+  min-width: 0;
+}
+.pdf-label input[type="checkbox"] {
+  accent-color: var(--green-mid);
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+}
+.pdf-icon  { font-size: 13px; flex-shrink: 0; }
+.pdf-name  {
+  font-size: 11px;
+  color: var(--text-dark);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* ── Mode badge ───────────────────────────────────────────── */
+.pdf-mode-badge {
+  padding: 6px 12px 10px;
+  display: flex;
+  justify-content: center;
+}
+
+.badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 20px;
+  letter-spacing: .3px;
+}
+.badge-off    { background: #fee2e2; color: #dc2626; }
+.badge-single { background: var(--green-pale); color: var(--green-dark); }
+.badge-dual   { background: var(--green-mid); color: #fff; }
+
+/* ── Misc ─────────────────────────────────────────────────── */
+.pdf-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 4px 2px;
+  line-height: 1.5;
+}
+.pdf-error {
+  font-size: 11px;
+  color: #dc2626;
+}
+
+
+
+================================================================================
+FILE: frontend\src\styles\Sidebar.css
+================================================================================
+
+.sidebar {
+  width: var(--sidebar-w);
+  min-width: var(--sidebar-w);
+  background: var(--green-dark);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.sidebar-header {
+  padding: 16px 14px 12px;
+  border-bottom: 1px solid rgba(255,255,255,.1);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.brand-icon { font-size: 20px; }
+.brand-name {
+  font-size: 18px;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: -.3px;
+}
+
+.new-chat-btn {
+  background: var(--green-mid);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-md);
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  transition: background .15s;
+}
+.new-chat-btn:hover { background: var(--green-light); color: var(--green-dark); }
+
+.sidebar-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 8px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,.15) transparent;
+}
+
+.sidebar-footer {
+  padding: 12px 14px;
+  border-top: 1px solid rgba(255,255,255,.1);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.user-badge { color: rgba(255,255,255,.8); font-size: 12px; }
+.logout-btn {
+  background: none;
+  border: 1px solid rgba(255,255,255,.25);
+  color: rgba(255,255,255,.7);
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+  font-size: 12px;
+  transition: all .15s;
+}
+.logout-btn:hover { background: rgba(255,255,255,.1); color: #fff; }
+
+/* ── Group list ───────────────────────────────────────────── */
+.group-list { display: flex; flex-direction: column; gap: 4px; }
+
+.new-group-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.new-group-row input {
+  flex: 1;
+  background: rgba(255,255,255,.1);
+  border: 1px solid rgba(255,255,255,.2);
+  border-radius: var(--radius-sm);
+  padding: 5px 8px;
+  color: #fff;
+  font-size: 12px;
+  outline: none;
+}
+.new-group-row input::placeholder { color: rgba(255,255,255,.45); }
+.new-group-row input:focus { border-color: var(--green-light); }
+.new-group-row .icon-btn { color: #fff; font-size: 16px; opacity: .7; }
+.new-group-row .icon-btn:hover { opacity: 1; background: rgba(255,255,255,.1); }
+
+.group-item { border-radius: var(--radius-sm); overflow: hidden; }
+
+.group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: rgba(255,255,255,.85);
+  transition: background .15s;
+  user-select: none;
+}
+.group-header:hover { background: rgba(255,255,255,.08); }
+.group-header.active { background: rgba(255,255,255,.12); }
+
+.group-icon { font-size: 14px; flex-shrink: 0; }
+.group-name { flex: 1; font-size: 13px; font-weight: 500; truncate: ellipsis; overflow: hidden; white-space: nowrap; }
+
+.group-actions {
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity .15s;
+}
+.group-header:hover .group-actions { opacity: 1; }
+.group-actions .icon-btn { color: rgba(255,255,255,.7); }
+.group-actions .icon-btn:hover { color: #fff; background: rgba(255,255,255,.12); }
+
+/* ── Chat list ────────────────────────────────────────────── */
+.chat-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 0 4px 16px;
+}
+
+.chat-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: rgba(255,255,255,.7);
+  transition: background .15s;
+}
+.chat-item:hover { background: rgba(255,255,255,.07); color: rgba(255,255,255,.9); }
+.chat-item.active { background: rgba(255,255,255,.14); color: #fff; }
+
+.chat-icon { font-size: 12px; flex-shrink: 0; }
+.chat-name { flex: 1; font-size: 12px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+.chat-actions {
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity .15s;
+}
+.chat-item:hover .chat-actions { opacity: 1; }
+.chat-actions .icon-btn { color: rgba(255,255,255,.6); }
+.chat-actions .icon-btn:hover { color: #fff; background: rgba(255,255,255,.1); }
+
+
+
+================================================================================
+FILE: frontend\src\styles\TopBar.css
+================================================================================
+
+.topbar {
+  height: var(--topbar-h);
+  background: var(--beige-white);
+  border-bottom: 1px solid var(--beige-mid);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.topbar-left {
+  flex-shrink: 0;
+  min-width: 120px;
+}
+
+.topbar-group-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--green-dark);
+}
+
+.topbar-placeholder {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.topbar-chats {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex: 1;
+}
+.topbar-chats::-webkit-scrollbar { display: none; }
+
+.topbar-chat-tab {
+  flex-shrink: 0;
+  padding: 5px 14px;
+  border-radius: 20px;
+  border: 1.5px solid var(--beige-dark);
+  background: transparent;
+  color: var(--text-mid);
+  font-size: 12px;
+  font-weight: 500;
+  transition: all .15s;
+  white-space: nowrap;
+}
+.topbar-chat-tab:hover {
+  border-color: var(--green-mid);
+  color: var(--green-dark);
+  background: var(--green-pale);
+}
+.topbar-chat-tab.active {
+  background: var(--green-mid);
+  border-color: var(--green-mid);
+  color: #fff;
+}
+
+
