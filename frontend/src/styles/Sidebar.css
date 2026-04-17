@@ -1,0 +1,156 @@
+.sidebar {
+  width: var(--sidebar-w);
+  min-width: var(--sidebar-w);
+  background: var(--green-dark);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.sidebar-header {
+  padding: 16px 14px 12px;
+  border-bottom: 1px solid rgba(255,255,255,.1);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.brand-icon { font-size: 20px; }
+.brand-name {
+  font-size: 18px;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: -.3px;
+}
+
+.new-chat-btn {
+  background: var(--green-mid);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-md);
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  transition: background .15s;
+}
+.new-chat-btn:hover { background: var(--green-light); color: var(--green-dark); }
+
+.sidebar-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 8px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,.15) transparent;
+}
+
+.sidebar-footer {
+  padding: 12px 14px;
+  border-top: 1px solid rgba(255,255,255,.1);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.user-badge { color: rgba(255,255,255,.8); font-size: 12px; }
+.logout-btn {
+  background: none;
+  border: 1px solid rgba(255,255,255,.25);
+  color: rgba(255,255,255,.7);
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+  font-size: 12px;
+  transition: all .15s;
+}
+.logout-btn:hover { background: rgba(255,255,255,.1); color: #fff; }
+
+/* ── Group list ───────────────────────────────────────────── */
+.group-list { display: flex; flex-direction: column; gap: 4px; }
+
+.new-group-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.new-group-row input {
+  flex: 1;
+  background: rgba(255,255,255,.1);
+  border: 1px solid rgba(255,255,255,.2);
+  border-radius: var(--radius-sm);
+  padding: 5px 8px;
+  color: #fff;
+  font-size: 12px;
+  outline: none;
+}
+.new-group-row input::placeholder { color: rgba(255,255,255,.45); }
+.new-group-row input:focus { border-color: var(--green-light); }
+.new-group-row .icon-btn { color: #fff; font-size: 16px; opacity: .7; }
+.new-group-row .icon-btn:hover { opacity: 1; background: rgba(255,255,255,.1); }
+
+.group-item { border-radius: var(--radius-sm); overflow: hidden; }
+
+.group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: rgba(255,255,255,.85);
+  transition: background .15s;
+  user-select: none;
+}
+.group-header:hover { background: rgba(255,255,255,.08); }
+.group-header.active { background: rgba(255,255,255,.12); }
+
+.group-icon { font-size: 14px; flex-shrink: 0; }
+.group-name { flex: 1; font-size: 13px; font-weight: 500; truncate: ellipsis; overflow: hidden; white-space: nowrap; }
+
+.group-actions {
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity .15s;
+}
+.group-header:hover .group-actions { opacity: 1; }
+.group-actions .icon-btn { color: rgba(255,255,255,.7); }
+.group-actions .icon-btn:hover { color: #fff; background: rgba(255,255,255,.12); }
+
+/* ── Chat list ────────────────────────────────────────────── */
+.chat-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 0 4px 16px;
+}
+
+.chat-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: rgba(255,255,255,.7);
+  transition: background .15s;
+}
+.chat-item:hover { background: rgba(255,255,255,.07); color: rgba(255,255,255,.9); }
+.chat-item.active { background: rgba(255,255,255,.14); color: #fff; }
+
+.chat-icon { font-size: 12px; flex-shrink: 0; }
+.chat-name { flex: 1; font-size: 12px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+.chat-actions {
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity .15s;
+}
+.chat-item:hover .chat-actions { opacity: 1; }
+.chat-actions .icon-btn { color: rgba(255,255,255,.6); }
+.chat-actions .icon-btn:hover { color: #fff; background: rgba(255,255,255,.1); }

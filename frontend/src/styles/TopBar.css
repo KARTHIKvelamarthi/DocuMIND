@@ -1,0 +1,59 @@
+.topbar {
+  height: var(--topbar-h);
+  background: var(--beige-white);
+  border-bottom: 1px solid var(--beige-mid);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.topbar-left {
+  flex-shrink: 0;
+  min-width: 120px;
+}
+
+.topbar-group-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--green-dark);
+}
+
+.topbar-placeholder {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.topbar-chats {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex: 1;
+}
+.topbar-chats::-webkit-scrollbar { display: none; }
+
+.topbar-chat-tab {
+  flex-shrink: 0;
+  padding: 5px 14px;
+  border-radius: 20px;
+  border: 1.5px solid var(--beige-dark);
+  background: transparent;
+  color: var(--text-mid);
+  font-size: 12px;
+  font-weight: 500;
+  transition: all .15s;
+  white-space: nowrap;
+}
+.topbar-chat-tab:hover {
+  border-color: var(--green-mid);
+  color: var(--green-dark);
+  background: var(--green-pale);
+}
+.topbar-chat-tab.active {
+  background: var(--green-mid);
+  border-color: var(--green-mid);
+  color: #fff;
+}

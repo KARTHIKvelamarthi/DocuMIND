@@ -1,0 +1,68 @@
+.inputbar-wrapper {
+  padding: 12px 32px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.inputbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  background: var(--beige-white);
+  border: 1.5px solid var(--beige-dark);
+  border-radius: var(--radius-lg);
+  padding: 10px 14px;
+  box-shadow: var(--shadow-sm);
+  transition: border-color .15s, box-shadow .15s;
+}
+
+.inputbar:focus-within {
+  border-color: var(--green-mid);
+  box-shadow: 0 0 0 3px rgba(64,145,108,.12);
+}
+
+.inputbar-disabled {
+  opacity: .55;
+  pointer-events: none;
+}
+
+.inputbar-textarea {
+  flex: 1;
+  border: none;
+  background: transparent;
+  resize: none;
+  font-size: 14px;
+  line-height: 1.5;
+  outline: none;
+  max-height: 140px;
+  overflow-y: auto;
+  color: var(--text-dark);
+}
+.inputbar-textarea::placeholder { color: var(--text-muted); }
+
+.send-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--green-mid);
+  color: #fff;
+  border: none;
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background .15s, transform .1s;
+}
+.send-btn:hover:not(:disabled) {
+  background: var(--green-dark);
+  transform: scale(1.05);
+}
+.send-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+.inputbar-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+}
